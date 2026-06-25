@@ -43,6 +43,12 @@ body {
   height: 24px;
   flex-shrink: 0;
 }
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+.ai-av.thinking svg {
+  animation: spin 1.2s linear infinite;
+}
 
 .brand-name {
   font-size: 17px;
@@ -374,9 +380,10 @@ body {
   word-break: break-word;
 }
 .ai-bubble {
-  background: #efefeb;
+  background: transparent;
   color: #1a1a1a;
-  border-radius: 14px 14px 14px 4px;
+  border-radius: 0;
+  max-width: 100%;
 }
 .user-bubble {
   background: #1a1a1a;
@@ -425,6 +432,14 @@ body {
 }
 .ai-bubble pre code { background: none; padding: 0; color: #2a2a28; font-size: 11.5px; }
 .ai-bubble .md-gap { height: 4px; }
+.ai-bubble a {
+  color: #0066cc;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+  word-break: break-all;
+}
+.ai-bubble a:hover { color: #004499; }
 
 /* ── Code bubble (solve_code answers) ───────────────────────────────────────── */
 

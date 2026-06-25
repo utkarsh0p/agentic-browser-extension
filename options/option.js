@@ -1,22 +1,25 @@
 const PROVIDERS = ['claude', 'gemini', 'openai'];
+const TOOLS     = ['tavily', 'composio'];
 
 // Load saved status — never pre-fill keys, just show "Saved" badge
-chrome.storage.local.get(['apiKeys', 'apiProvider', 'apiKey'], (res) => {
-  const apiKeys = res.apiKeys || {};
+chrome.storage.local.get(['apiKeys', 'toolKeys', 'apiProvider', 'apiKey'], (res) => {
+  const apiKeys  = res.apiKeys  || {};
+  const toolKeys = res.toolKeys || {};
 
   // Migrate legacy single-key storage into apiKeys
   if (res.apiProvider && res.apiKey && !apiKeys[res.apiProvider]) {
     apiKeys[res.apiProvider] = res.apiKey;
   }
 
-  // If migration happened, persist merged keys
   if (res.apiProvider) {
     chrome.storage.local.set({ apiKeys });
   }
 
-  // Show saved badges for providers that have a key
   PROVIDERS.forEach(p => {
     if (apiKeys[p]) showBadge(p);
+  });
+  TOOLS.forEach(t => {
+    if (toolKeys[t]) showBadge(t);
   });
 });
 
@@ -39,8 +42,14 @@ document.getElementById('saveBtn').addEventListener('click', () => {
     if (val) newKeys[p] = val;
   });
 
-  if (Object.keys(newKeys).length === 0) {
-    setStatus('Enter at least one API key to save.', true);
+  const newToolKeys = {};
+  TOOLS.forEach(t => {
+    const val = document.getElementById(`key-${t}`).value.trim();
+    if (val) newToolKeys[t] = val;
+  });
+
+  if (Object.keys(newKeys).length === 0 && Object.keys(newToolKeys).length === 0) {
+    setStatus('Enter at least one key to save.', true);
     return;
   }
 
@@ -48,11 +57,12 @@ document.getElementById('saveBtn').addEventListener('click', () => {
   btn.disabled    = true;
   btn.textContent = 'Saving…';
 
-  chrome.storage.local.get(['apiKeys'], (res) => {
-    const merged = { ...(res.apiKeys || {}), ...newKeys };
-    chrome.storage.local.set({ apiKeys: merged }, () => {
-      // Show saved badges for newly saved providers
+  chrome.storage.local.get(['apiKeys', 'toolKeys'], (res) => {
+    const mergedApi   = { ...(res.apiKeys  || {}), ...newKeys };
+    const mergedTools = { ...(res.toolKeys || {}), ...newToolKeys };
+    chrome.storage.local.set({ apiKeys: mergedApi, toolKeys: mergedTools }, () => {
       Object.keys(newKeys).forEach(p => showBadge(p));
+      Object.keys(newToolKeys).forEach(t => showBadge(t));
       setStatus('Saved!', false);
       setTimeout(() => window.close(), 800);
     });

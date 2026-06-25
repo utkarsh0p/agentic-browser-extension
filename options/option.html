@@ -40,91 +40,161 @@
         </div>
       </div>
 
-      <!-- Provider rows -->
-      <div class="providers">
+      <!-- Two-column layout -->
+      <div class="columns">
 
-        <!-- Claude -->
-        <div class="provider-row">
-          <div class="row-header">
-            <div class="row-left">
-              <span class="prov-icon claude-icon">◆</span>
-              <div class="prov-meta">
-                <span class="prov-name">Claude</span>
-                <span class="prov-by">Anthropic</span>
+        <!-- Left: LLM Providers -->
+        <div class="column">
+          <h3 class="col-title">LLM Providers</h3>
+          <div class="providers">
+
+            <!-- Claude -->
+            <div class="provider-row">
+              <div class="row-header">
+                <div class="row-left">
+                  <span class="prov-icon claude-icon">◆</span>
+                  <div class="prov-meta">
+                    <span class="prov-name">Claude</span>
+                    <span class="prov-by">Anthropic</span>
+                  </div>
+                </div>
+                <div class="saved-badge" id="badge-claude">
+                  <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>
+                  Saved
+                </div>
+              </div>
+              <div class="row-input">
+                <div class="input-wrap">
+                  <input type="password" id="key-claude" class="key-input" placeholder="sk-ant-api03-…" autocomplete="off" spellcheck="false" />
+                  <button class="eye-btn" type="button" data-for="key-claude">
+                    <svg class="eye-open" xmlns="http://www.w3.org/2000/svg" width="15" height="15" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg>
+                    <svg class="eye-closed" style="display:none" xmlns="http://www.w3.org/2000/svg" width="15" height="15" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21"/></svg>
+                  </button>
+                </div>
+                <p class="hint">Get at <a href="https://console.anthropic.com/" target="_blank">console.anthropic.com</a> — starts with <code>sk-ant-</code></p>
               </div>
             </div>
-            <div class="saved-badge" id="badge-claude">
-              <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>
-              Saved
+
+            <!-- Gemini -->
+            <div class="provider-row">
+              <div class="row-header">
+                <div class="row-left">
+                  <span class="prov-icon gemini-icon">✦</span>
+                  <div class="prov-meta">
+                    <span class="prov-name">Gemini</span>
+                    <span class="prov-by">Google</span>
+                  </div>
+                </div>
+                <div class="saved-badge" id="badge-gemini">
+                  <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>
+                  Saved
+                </div>
+              </div>
+              <div class="row-input">
+                <div class="input-wrap">
+                  <input type="password" id="key-gemini" class="key-input" placeholder="AIzaSy…" autocomplete="off" spellcheck="false" />
+                  <button class="eye-btn" type="button" data-for="key-gemini">
+                    <svg class="eye-open" xmlns="http://www.w3.org/2000/svg" width="15" height="15" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg>
+                    <svg class="eye-closed" style="display:none" xmlns="http://www.w3.org/2000/svg" width="15" height="15" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21"/></svg>
+                  </button>
+                </div>
+                <p class="hint">Get at <a href="https://aistudio.google.com/apikey" target="_blank">aistudio.google.com</a> — starts with <code>AIza</code></p>
+              </div>
             </div>
-          </div>
-          <div class="row-input">
-            <div class="input-wrap">
-              <input type="password" id="key-claude" class="key-input" placeholder="sk-ant-api03-…" autocomplete="off" spellcheck="false" />
-              <button class="eye-btn" type="button" data-for="key-claude">
-                <svg class="eye-open" xmlns="http://www.w3.org/2000/svg" width="15" height="15" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg>
-                <svg class="eye-closed" style="display:none" xmlns="http://www.w3.org/2000/svg" width="15" height="15" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21"/></svg>
-              </button>
+
+            <!-- OpenAI -->
+            <div class="provider-row">
+              <div class="row-header">
+                <div class="row-left">
+                  <span class="prov-icon openai-icon">⬡</span>
+                  <div class="prov-meta">
+                    <span class="prov-name">GPT</span>
+                    <span class="prov-by">OpenAI</span>
+                  </div>
+                </div>
+                <div class="saved-badge" id="badge-openai">
+                  <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>
+                  Saved
+                </div>
+              </div>
+              <div class="row-input">
+                <div class="input-wrap">
+                  <input type="password" id="key-openai" class="key-input" placeholder="sk-proj-…" autocomplete="off" spellcheck="false" />
+                  <button class="eye-btn" type="button" data-for="key-openai">
+                    <svg class="eye-open" xmlns="http://www.w3.org/2000/svg" width="15" height="15" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg>
+                    <svg class="eye-closed" style="display:none" xmlns="http://www.w3.org/2000/svg" width="15" height="15" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21"/></svg>
+                  </button>
+                </div>
+                <p class="hint">Get at <a href="https://platform.openai.com/api-keys" target="_blank">platform.openai.com</a> — starts with <code>sk-</code></p>
+              </div>
             </div>
-            <p class="hint">Get at <a href="https://console.anthropic.com/" target="_blank">console.anthropic.com</a> — starts with <code>sk-ant-</code></p>
+
           </div>
         </div>
 
-        <!-- Gemini -->
-        <div class="provider-row">
-          <div class="row-header">
-            <div class="row-left">
-              <span class="prov-icon gemini-icon">✦</span>
-              <div class="prov-meta">
-                <span class="prov-name">Gemini</span>
-                <span class="prov-by">Google</span>
+        <!-- Right: External Tools -->
+        <div class="column">
+          <h3 class="col-title">External Tools</h3>
+          <div class="providers">
+
+            <!-- Tavily -->
+            <div class="provider-row">
+              <div class="row-header">
+                <div class="row-left">
+                  <span class="prov-icon tavily-icon">T</span>
+                  <div class="prov-meta">
+                    <span class="prov-name">Tavily</span>
+                    <span class="prov-by">Web Search</span>
+                  </div>
+                </div>
+                <div class="saved-badge" id="badge-tavily">
+                  <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>
+                  Saved
+                </div>
+              </div>
+              <div class="row-input">
+                <div class="input-wrap">
+                  <input type="password" id="key-tavily" class="key-input" placeholder="tvly-…" autocomplete="off" spellcheck="false" />
+                  <button class="eye-btn" type="button" data-for="key-tavily">
+                    <svg class="eye-open" xmlns="http://www.w3.org/2000/svg" width="15" height="15" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg>
+                    <svg class="eye-closed" style="display:none" xmlns="http://www.w3.org/2000/svg" width="15" height="15" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21"/></svg>
+                  </button>
+                </div>
+                <p class="hint">Get at <a href="https://app.tavily.com/home" target="_blank">app.tavily.com</a> — starts with <code>tvly-</code></p>
               </div>
             </div>
-            <div class="saved-badge" id="badge-gemini">
-              <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>
-              Saved
+
+            <!-- Composio -->
+            <div class="provider-row">
+              <div class="row-header">
+                <div class="row-left">
+                  <span class="prov-icon composio-icon">C</span>
+                  <div class="prov-meta">
+                    <span class="prov-name">Composio</span>
+                    <span class="prov-by">App Integrations</span>
+                  </div>
+                </div>
+                <div class="saved-badge" id="badge-composio">
+                  <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>
+                  Saved
+                </div>
+              </div>
+              <div class="row-input">
+                <div class="input-wrap">
+                  <input type="password" id="key-composio" class="key-input" placeholder="ak_…" autocomplete="off" spellcheck="false" />
+                  <button class="eye-btn" type="button" data-for="key-composio">
+                    <svg class="eye-open" xmlns="http://www.w3.org/2000/svg" width="15" height="15" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg>
+                    <svg class="eye-closed" style="display:none" xmlns="http://www.w3.org/2000/svg" width="15" height="15" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21"/></svg>
+                  </button>
+                </div>
+                <p class="hint">Get at <a href="https://app.composio.dev/" target="_blank">app.composio.dev</a> — starts with <code>ak_</code></p>
+              </div>
             </div>
-          </div>
-          <div class="row-input">
-            <div class="input-wrap">
-              <input type="password" id="key-gemini" class="key-input" placeholder="AIzaSy…" autocomplete="off" spellcheck="false" />
-              <button class="eye-btn" type="button" data-for="key-gemini">
-                <svg class="eye-open" xmlns="http://www.w3.org/2000/svg" width="15" height="15" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg>
-                <svg class="eye-closed" style="display:none" xmlns="http://www.w3.org/2000/svg" width="15" height="15" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21"/></svg>
-              </button>
-            </div>
-            <p class="hint">Get at <a href="https://aistudio.google.com/apikey" target="_blank">aistudio.google.com</a> — starts with <code>AIza</code></p>
+
           </div>
         </div>
 
-        <!-- OpenAI -->
-        <div class="provider-row">
-          <div class="row-header">
-            <div class="row-left">
-              <span class="prov-icon openai-icon">⬡</span>
-              <div class="prov-meta">
-                <span class="prov-name">GPT</span>
-                <span class="prov-by">OpenAI</span>
-              </div>
-            </div>
-            <div class="saved-badge" id="badge-openai">
-              <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>
-              Saved
-            </div>
-          </div>
-          <div class="row-input">
-            <div class="input-wrap">
-              <input type="password" id="key-openai" class="key-input" placeholder="sk-proj-…" autocomplete="off" spellcheck="false" />
-              <button class="eye-btn" type="button" data-for="key-openai">
-                <svg class="eye-open" xmlns="http://www.w3.org/2000/svg" width="15" height="15" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg>
-                <svg class="eye-closed" style="display:none" xmlns="http://www.w3.org/2000/svg" width="15" height="15" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21"/></svg>
-              </button>
-            </div>
-            <p class="hint">Get at <a href="https://platform.openai.com/api-keys" target="_blank">platform.openai.com</a> — starts with <code>sk-</code></p>
-          </div>
-        </div>
-
-      </div><!-- /providers -->
+      </div><!-- /columns -->
 
       <button class="save-btn" id="saveBtn">Save Keys</button>
       <div class="status-msg" id="statusMsg"></div>

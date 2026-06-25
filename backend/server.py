@@ -1,14 +1,18 @@
 import asyncio
 import json
-import re
 from functools import lru_cache
 from typing import Optional
+
+import os
 
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+from langchain_core.tools import tool
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langgraph.prebuilt import create_react_agent
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
@@ -21,7 +25,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-LLM_TIMEOUT = 60  # seconds
+LLM_TIMEOUT = 120
 
 
 # ── Cached client factories ────────────────────────────────────────────────────
@@ -48,7 +52,6 @@ def get_claude_client(token: str, model_id: str):
     return ChatAnthropic(model=model_id, anthropic_api_key=token, streaming=True)
 
 
-
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def get_top_chunks(query: str, chunks: list, embedding=None) -> str:
@@ -66,17 +69,7 @@ def get_top_chunks(query: str, chunks: list, embedding=None) -> str:
     return "\n\n".join(chunks[i] for i, _ in top_indices)
 
 
-def extract_chunk(chunk) -> str:
-    if isinstance(chunk, str):
-        return chunk
-    if hasattr(chunk, "content"):
-        c = chunk.content
-        return c if isinstance(c, str) else ""
-    return ""
-
-
-def _resolve_llm(provider: str, token: str, model: Optional[str]):
-    """Returns (llm, embedding) for the given provider. embedding may be None."""
+def _resolve_llm(provider: str, token: str, model: Optional[str], gemini_key: Optional[str] = None):
     if provider == "openai":
         model_id = model or "gpt-4.1-mini"
         return get_openai_clients(token, model_id)
@@ -85,15 +78,13 @@ def _resolve_llm(provider: str, token: str, model: Optional[str]):
         return get_gemini_clients(token, model_id)
     if provider == "claude":
         model_id = model or "claude-haiku-4-5"
-        return get_claude_client(token, model_id), None
+        llm = get_claude_client(token, model_id)
+        if gemini_key:
+            from langchain_google_genai import GoogleGenerativeAIEmbeddings
+            embedding = GoogleGenerativeAIEmbeddings(model="gemini-embedding-001", google_api_key=gemini_key)
+            return llm, embedding
+        return llm, None
     raise ValueError(f"Unsupported provider: {provider}")
-
-
-def _auth_error(e: Exception, provider: str) -> HTTPException:
-    msg = str(e).lower()
-    if any(k in msg for k in ("api key", "apikey", "authentication", "unauthorized", "invalid")):
-        return HTTPException(status_code=401, detail=f"Invalid API key for {provider}. Check your key in Settings.")
-    return HTTPException(status_code=500, detail=f"Server error ({provider}): {e}")
 
 
 def _sse_error_handler(e: Exception, provider: str) -> str:
@@ -103,45 +94,15 @@ def _sse_error_handler(e: Exception, provider: str) -> str:
     return f"Stream error ({provider}): {e}"
 
 
-# ── YouTube transcript helper ──────────────────────────────────────────────────
-
-def _fetch_transcript(video_id: str) -> list[dict]:
-    from youtube_transcript_api import YouTubeTranscriptApi
-    # Try English first
-    try:
-        fetched = YouTubeTranscriptApi.get_transcript(
-            video_id, languages=["en", "en-US", "en-GB", "en-CA", "en-AU"]
-        )
-    except Exception:
-        # Fall back to first available transcript in any language
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-        fetched = None
-        for t in transcript_list:
-            try:
-                fetched = t.fetch()
-                break
-            except Exception:
-                continue
-        if fetched is None:
-            raise RuntimeError(f"No transcript available for video {video_id}")
-    result = []
-    for e in fetched:
-        if hasattr(e, "text"):
-            result.append({"text": e.text, "start": float(e.start)})
-        elif isinstance(e, dict):
-            result.append({"text": e["text"], "start": float(e["start"])})
-    return result
-
-
-# ── Unified /chat endpoint ─────────────────────────────────────────────────────
+# ── /chat endpoint ────────────────────────────────────────────────────────────
 
 class ChatRequest(BaseModel):
-    query:    str
-    chunks:   list[str]            = []
-    model:    Optional[str]        = None
-    history:  Optional[list[dict]] = None   # [{"role": "user"|"assistant", "content": "..."}]
-    youtube:  Optional[dict]       = None   # {"video_id": str, "current_time": int|None}
-    leetcode: Optional[dict]       = None   # {"title": str, "description": str, "language": str, "current_code": str}
+    query:      str
+    text:       str                  = ""
+    model:      Optional[str]        = None
+    history:    Optional[list[dict]] = None
+    gemini_key: Optional[str]        = None
+    tool_keys:  Optional[dict]       = None
 
 
 @app.post("/chat")
@@ -151,7 +112,6 @@ async def chat(
     provider: str = Header(..., alias="Provider"),
 ):
     from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
-    from langchain_core.tools import tool
 
     token    = token.strip()
     provider = provider.lower()
@@ -160,53 +120,87 @@ async def chat(
         raise HTTPException(status_code=400, detail="No API key provided. Open Settings and add your key.")
 
     try:
-        llm, embedding = _resolve_llm(provider, token, body.model)
+        llm, embedding = _resolve_llm(provider, token, body.model, body.gemini_key)
     except Exception as e:
-        raise _auth_error(e, provider)
+        msg = str(e).lower()
+        if any(k in msg for k in ("api key", "apikey", "authentication", "unauthorized", "invalid")):
+            raise HTTPException(status_code=401, detail=f"Invalid API key for {provider}. Check your key in Settings.")
+        raise HTTPException(status_code=500, detail=f"Server error ({provider}): {e}")
 
-    # ── Tool definitions (coding tools only — RAG/YouTube use direct retrieval) ──
+    # ── Chunk the page text ───────────────────────────────────────────────────
+    chunks = []
+    if body.text.strip():
+        splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+        chunks = splitter.split_text(body.text)
 
+    # ── Define the search_page tool ───────────────────────────────────────────
     @tool
-    def explain_problem() -> str:
-        """Explain the coding problem in simple terms. Break down constraints, input/output format, and walk through an example.
-        Use when the student wants to understand what the problem is asking."""
-        return "explain"
+    def search_page(query: str) -> str:
+        """Search the current webpage for content relevant to the query.
+        Use this when the user asks about something on the page they are viewing."""
+        if not chunks:
+            return "No page content available."
+        try:
+            return get_top_chunks(query, chunks, embedding)
+        except Exception:
+            return get_top_chunks(query, chunks, None)
 
+    # ── Define the summarize_page tool ──────────────────────────────────────────
     @tool
-    def suggest_approach() -> str:
-        """Suggest the best algorithm or data structure approach without writing code.
-        Use when the student asks what technique to use, how to approach it, or which algorithm is best."""
-        return "approach"
+    def summarize_page() -> str:
+        """Return the full page text for summarization.
+        Use this when the user asks for a summary, overview, or wants to know what the page is about."""
+        if not body.text.strip():
+            return "No page content available."
+        max_chars = 15000
+        text = body.text.strip()
+        if len(text) > max_chars:
+            return text[:max_chars] + "\n\n[Content truncated — page is very long]"
+        return text
 
-    @tool
-    def analyze_code() -> str:
-        """Analyze the current code for time and space complexity and suggest improvements.
-        Use when the student asks about efficiency, Big O notation, or wants their code reviewed."""
-        return "analyze"
+    # ── Define the web_search tool (Tavily) ─────────────────────────────────────
+    tools = [search_page, summarize_page]
 
-    @tool
-    def give_hint() -> str:
-        """Give a progressive hint to guide the student without revealing the full solution.
-        Use when the student asks for a hint or says they are stuck."""
-        return "hint"
+    tavily_key = (body.tool_keys or {}).get("tavily")
+    if tavily_key:
+        from tavily import TavilyClient
+        tavily_client = TavilyClient(api_key=tavily_key)
 
-    @tool
-    def solve_code() -> str:
-        """Generate a complete working solution for the problem.
-        Use when the student explicitly asks to solve it or when no specific question is asked."""
-        return "solve"
+        @tool
+        def web_search(query: str) -> str:
+            """Search the internet for up-to-date information.
+            Use this when the user asks about something not found on the current page,
+            or needs external facts, news, or verification."""
+            results = tavily_client.search(query, max_results=3)
+            return "\n\n".join(
+                f"{r['title']}\n{r['content']}" for r in results.get("results", [])
+            )
 
-    # ── Context flags ──────────────────────────────────────────────────────────
-    has_lc   = bool(body.leetcode and body.leetcode.get("description"))
-    has_yt   = bool(body.youtube and body.youtube.get("video_id"))
-    has_page = bool(body.chunks)
+        tools.append(web_search)
 
-    chosen_tool: str | None = None
+    # ── Composio meta tools ──────────────────────────────────────────────────
+    composio_key = (body.tool_keys or {}).get("composio")
+    if composio_key:
+        from composio import Composio
+        from composio_langchain import LangchainProvider
+        composio = Composio(api_key=composio_key, provider=LangchainProvider())
+        session = composio.create(user_id="default")
+        composio_tools = session.tools()
+        tools.extend(composio_tools)
 
-    # ── Build base message history ─────────────────────────────────────────────
-    messages = [
-        SystemMessage(content="You are SiteWhisper, a helpful AI assistant.")
-    ]
+    # ── Build the ReAct agent ─────────────────────────────────────────────────
+    agent = create_react_agent(
+        model=llm,
+        tools=tools,
+        prompt=(
+            "You are SiteWhisper, a helpful AI assistant. "
+            "You have access to tools — use them when they can help answer the user's question. "
+            "If no tool is needed, answer directly from your knowledge."
+        ),
+    )
+
+    # ── Build message history ─────────────────────────────────────────────────
+    messages = []
     for h in (body.history or []):
         if h.get("role") == "user":
             messages.append(HumanMessage(content=h["content"]))
@@ -214,144 +208,30 @@ async def chat(
             messages.append(AIMessage(content=h["content"]))
     messages.append(HumanMessage(content=body.query))
 
-    # ── Coding path ────────────────────────────────────────────────────────────
-    if has_lc:
-        lc = body.leetcode
-        coding_tools = [explain_problem, suggest_approach, analyze_code, give_hint, solve_code]
-
-        if body.query:
-            try:
-                decision = await llm.bind_tools(coding_tools).ainvoke([
-                    SystemMessage(content="You are a coding assistant. Choose the right tool based on what the student needs."),
-                    HumanMessage(content=f"Problem: {lc.get('title', '')}\n\nStudent says: {body.query}"),
-                ])
-                if decision.tool_calls:
-                    chosen_tool = decision.tool_calls[0]["name"]
-            except Exception:
-                pass
-
-        if not chosen_tool:
-            chosen_tool = "solve_code"
-
-        problem_ctx = f"Problem: {lc.get('title', '')}\n\n{lc.get('description', '')}"
-        lang        = lc.get("language", "Python3")
-
-        # Override lang if user explicitly named one in their query
-        _lang_match = re.search(
-            r'c\+\+|\b(cpp|c#|csharp|python3?|java(?:script)?|typescript|golang?|rust|swift|kotlin|ruby|php|scala)\b',
-            body.query, re.IGNORECASE
-        )
-        if _lang_match:
-            lang = _lang_match.group(0)
-
-        # Only use current_code if it looks like a real function/class definition
-        _cur = lc.get("current_code") or ""
-        real_code = _cur if re.search(r'\b(def |class |function |func |public |void |int |vector|#include)\b', _cur) else ""
-        code_ctx  = f"\n\nCurrent code:\n```\n{real_code}\n```" if real_code else ""
-
-        if chosen_tool == "explain_problem":
-            prompt = (
-                f"Explain this coding problem clearly for a student.\n"
-                f"Break down: what it's asking, constraints, input/output format, and walk through an example.\n\n"
-                f"{problem_ctx}"
-            )
-        elif chosen_tool == "suggest_approach":
-            prompt = (
-                f"Suggest the best algorithm or data structure approach for this problem.\n"
-                f"Do NOT write the full solution. Explain the technique, why it works, and the intuition.\n\n"
-                f"{problem_ctx}{code_ctx}"
-            )
-        elif chosen_tool == "analyze_code":
-            prompt = (
-                f"Analyze this code for time and space complexity.\n"
-                f"Identify bottlenecks and suggest concrete optimizations with reasoning.\n\n"
-                f"{problem_ctx}{code_ctx}"
-            )
-        elif chosen_tool == "give_hint":
-            prompt = (
-                f"Give a helpful hint to guide the student toward the solution without revealing it.\n"
-                f"Be Socratic — nudge them in the right direction with a guiding question or observation.\n\n"
-                f"{problem_ctx}{code_ctx}"
-            )
-        else:  # solve_code
-            sig = f"\n\nUse this function signature as the starting point:\n```\n{real_code}\n```" if real_code else ""
-            prompt = (
-                f"You are an expert competitive programmer.\n"
-                f"Solve the following problem in {lang}.\n"
-                f"Return ONLY the solution code — no explanation, no markdown fences, no extra text.\n"
-                f"The code must be directly pasteable into the editor.{sig}\n\n"
-                f"{problem_ctx}"
-            )
-
-        messages = [HumanMessage(content=prompt)]
-
-    # ── RAG / YouTube path ─────────────────────────────────────────────────────
-    elif has_page or has_yt:
-        if has_page and not has_yt:
-            # Always retrieve from page — no LLM decision needed
-            try:
-                context = await run_in_threadpool(get_top_chunks, body.query, body.chunks, embedding)
-            except Exception:
-                # Embedding API failed — fall back to TF-IDF
-                context = await run_in_threadpool(get_top_chunks, body.query, body.chunks, None)
-            if context:
-                chosen_tool = "search_page"
-                messages[0] = SystemMessage(content=(
-                    "You are SiteWhisper, a helpful AI assistant.\n\n"
-                    "Relevant page content:\n" + context + "\n\n"
-                    "Answer the user's question using the above content. "
-                    "If the content doesn't help, answer from general knowledge."
-                ))
-        else:
-            # YouTube — always fetch transcript, no LLM tool-calling decision needed
-            try:
-                transcript  = await run_in_threadpool(_fetch_transcript, body.youtube["video_id"])
-                full_text   = " ".join(s["text"] for s in transcript)
-                ts          = body.youtube.get("current_time") or 0
-                nearby      = [s for s in transcript if abs(s["start"] - ts) <= 180]
-                nearby_text = " ".join(s["text"] for s in (nearby or transcript[:40]))
-                mins, secs  = divmod(int(ts), 60)
-
-                yt_ctx = f"[Around {mins}:{secs:02d}] {nearby_text}"
-                if full_text:
-                    trunc   = (full_text[:10000] + " … [truncated]") if len(full_text) > 10000 else full_text
-                    yt_ctx += f"\n\n[Full transcript]: {trunc}"
-
-                chosen_tool = "youtube_summarize"
-                messages[0] = SystemMessage(content=(
-                    "You are SiteWhisper, a helpful AI assistant. "
-                    "The user is watching a YouTube video.\n\n"
-                    "Video transcript:\n" + yt_ctx + "\n\n"
-                    "Answer the user's question about this video."
-                ))
-            except Exception as yt_err:
-                print(f"[YouTube transcript error] {yt_err}")
-                # Transcript unavailable — fall back to page content if present
-                if has_page:
-                    try:
-                        context = await run_in_threadpool(get_top_chunks, body.query, body.chunks, embedding)
-                    except Exception:
-                        context = await run_in_threadpool(get_top_chunks, body.query, body.chunks, None)
-                    if context:
-                        chosen_tool = "search_page"
-                        messages[0] = SystemMessage(content=(
-                            "You are SiteWhisper, a helpful AI assistant.\n\n"
-                            "Relevant page content:\n" + context + "\n\n"
-                            "Answer the user's question using the above content. "
-                            "If the content doesn't help, answer from general knowledge."
-                        ))
-
-    # ── Stream the final answer ────────────────────────────────────────────────
+    # ── Stream the agent response ─────────────────────────────────────────────
     async def generate():
-        is_youtube = chosen_tool in ("youtube_summarize", "youtube_explain_moment")
-        used_rag   = chosen_tool is not None
-        yield f"data: {json.dumps({'tool': chosen_tool, 'used_rag': used_rag, 'is_youtube': is_youtube})}\n\n"
+        yield f"data: {json.dumps({'status': 'started'})}\n\n"
         try:
             async with asyncio.timeout(LLM_TIMEOUT):
-                async for chunk in llm.astream(messages):
-                    text = extract_chunk(chunk)
-                    if text:
-                        yield f"data: {json.dumps({'text': text})}\n\n"
+                async for chunk in agent.astream(
+                    {"messages": messages}, stream_mode="messages"
+                ):
+                    msg, metadata = chunk
+                    if hasattr(msg, "tool_calls") and msg.tool_calls:
+                        for tc in msg.tool_calls:
+                            yield f"data: {json.dumps({'tool': tc['name']})}\n\n"
+                    if metadata.get("langgraph_node") == "tools":
+                        continue
+                    if not hasattr(msg, "content"):
+                        continue
+                    content = msg.content
+                    if isinstance(content, list):
+                        content = "".join(
+                            block.get("text", "") if isinstance(block, dict) else str(block)
+                            for block in content
+                        )
+                    if isinstance(content, str) and content:
+                        yield f"data: {json.dumps({'text': content})}\n\n"
         except TimeoutError:
             yield f"data: {json.dumps({'error': f'LLM timed out after {LLM_TIMEOUT}s.'})}\n\n"
         except Exception as e:
@@ -365,6 +245,6 @@ async def chat(
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    import os, uvicorn
+    import uvicorn
     workers = 1 if os.environ.get("RENDER") else 4
     uvicorn.run("server:app", host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), workers=workers)

@@ -1,6 +1,6 @@
 // ── Backend URL — toggle one line to switch between local and production ──────
 // const BACKEND = 'http://localhost:5000';        // ← local testing
-const BACKEND = 'https://chrome-rag-extension.onrender.com'; // ← production
+const BACKEND = 'http://147.93.169.144:5000';    // ← production
 
 // ── Avatars ───────────────────────────────────────────────────────────────────
 
@@ -27,12 +27,21 @@ const TYPING_SVG = `<svg class="dots-anim" width="28" height="12" viewBox="0 0 2
 
 function renderMarkdown(md) {
   const esc    = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-  const inline = s => s
-    .replace(/`([^`]+)`/g,        '<code>$1</code>')
-    .replace(/\*\*(.+?)\*\*/g,    '<strong>$1</strong>')
-    .replace(/__(.+?)__/g,         '<strong>$1</strong>')
-    .replace(/\*([^*\n]+)\*/g,    '<em>$1</em>')
-    .replace(/_([^_\n]+)_/g,      '<em>$1</em>');
+  const links  = [];
+  const LINK_MARK = '\x00L';
+  const saveLinks = s => s.replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, (_, text, url) => {
+    links.push(`<a href="${url}" target="_blank" rel="noopener">${esc(text)}</a>`);
+    return LINK_MARK + (links.length - 1) + '\x00';
+  });
+  const restoreLinks = s => s.replace(new RegExp(LINK_MARK + '(\\d+)\x00', 'g'), (_, i) => links[+i]);
+  const inline = s => restoreLinks(
+    saveLinks(s)
+      .replace(/`([^`]+)`/g,        '<code>$1</code>')
+      .replace(/\*\*(.+?)\*\*/g,    '<strong>$1</strong>')
+      .replace(/__(.+?)__/g,         '<strong>$1</strong>')
+      .replace(/\*([^*\n]+)\*/g,    '<em>$1</em>')
+      .replace(/_([^_\n]+)_/g,      '<em>$1</em>')
+  );
 
   const blocks = [];
   const MARK   = '\x00B';
@@ -101,7 +110,7 @@ const MODELS = {
 
 // ── Shared SSE stream reader ───────────────────────────────────────────────────
 
-async function readSSEStream(response, { onText, onMeta, onError }) {
+async function readSSEStream(response, { onText, onMeta, onError, onTool }) {
   const reader  = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
@@ -119,7 +128,8 @@ async function readSSEStream(response, { onText, onMeta, onError }) {
         try {
           const parsed = JSON.parse(raw);
           if (parsed.error)                            { onError?.(parsed.error); return; }
-          if ('used_rag' in parsed || 'tool' in parsed) { onMeta?.(parsed); continue; }
+          if (parsed.status)                              { onMeta?.(parsed); continue; }
+          if (parsed.tool)                               { onTool?.(parsed.tool); continue; }
           if (parsed.text)                               onText?.(parsed.text);
         } catch { /* skip malformed line */ }
       }
@@ -159,6 +169,7 @@ document.addEventListener('DOMContentLoaded', () => {
   let selectedProvider  = null;
   let selectedModel     = null;
   let savedApiKeys      = {};
+  let savedToolKeys     = {};
   let chatMessages      = [];
   let currentStreamEl   = null;
   let activeController  = null;
@@ -173,23 +184,54 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!on) askBtn.disabled = !input.value.trim();
   }
 
-  const CODE_TOOLS  = new Set(['explain_problem', 'suggest_approach', 'analyze_code', 'give_hint', 'solve_code']);
-  const TOOL_LABELS = {
-    explain_problem:  'Explanation',
-    suggest_approach: 'Approach',
-    analyze_code:     'Analysis',
-    give_hint:        'Hint',
-    solve_code:       'Solution',
-  };
+  // ── Chat persistence ────────────────────────────────────────────────────
 
-  const CODE_SITE_RE = /leetcode\.com\/problems\/|geeksforgeeks\.org\/problems\/|hackerrank\.com\/challenges\/|codeforces\.com\/problemset\/problem\//;
+  function saveChat(tabUrl) {
+    const data = { chatMessages };
+    if (tabUrl) data.chatPageUrl = tabUrl;
+    chrome.storage.local.set(data);
+  }
+
+  function loadChat(saved) {
+    if (!saved || saved.length === 0) return;
+    chatMessages = saved;
+    responseArea.classList.add('visible');
+    chatHistory.classList.add('visible');
+    for (const msg of chatMessages) {
+      const wrap = document.createElement('div');
+      if (msg.role === 'user') {
+        wrap.className = 'chat-msg user';
+        wrap.innerHTML = `<div class="chat-bubble user-bubble">${escHtml(msg.content)}</div><div class="chat-avatar user-av">${USER_AVATAR_SVG}</div>`;
+      } else {
+        wrap.className = 'chat-msg ai';
+        const bubble = document.createElement('div');
+        bubble.className = 'chat-bubble ai-bubble';
+        const textEl = document.createElement('div');
+        textEl.innerHTML = renderMarkdown(msg.content);
+        bubble.appendChild(textEl);
+        wrap.innerHTML = `<div class="chat-avatar ai-av">${AI_AVATAR_SVG}</div>`;
+        wrap.appendChild(bubble);
+      }
+      chatHistory.appendChild(wrap);
+    }
+    chatHistory.scrollTop = chatHistory.scrollHeight;
+  }
+
+  function clearChat() {
+    chatMessages = [];
+    chatHistory.innerHTML = '';
+    responseArea.classList.remove('visible');
+    chatHistory.classList.remove('visible');
+    chrome.storage.local.remove('chatMessages');
+  }
 
   // ── Load saved state ───────────────────────────────────────────────────────
 
   chrome.storage.local.get(
-    ['apiKeys', 'apiProvider', 'apiKey', 'selectedProvider', 'selectedModelId'],
-    (res) => {
-      savedApiKeys = res.apiKeys || {};
+    ['apiKeys', 'toolKeys', 'apiProvider', 'apiKey', 'selectedProvider', 'selectedModelId', 'chatMessages', 'chatPageUrl'],
+    async (res) => {
+      savedApiKeys  = res.apiKeys  || {};
+      savedToolKeys = res.toolKeys || {};
 
       // Migrate legacy single-key storage
       if (res.apiProvider && res.apiKey && !savedApiKeys[res.apiProvider])
@@ -206,10 +248,30 @@ document.addEventListener('DOMContentLoaded', () => {
 
       renderProviderBtn();
       renderModelBtn();
+
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      const currentUrl = tab?.url || '';
+      if (res.chatPageUrl && res.chatPageUrl !== currentUrl) {
+        clearChat();
+      } else {
+        loadChat(res.chatMessages);
+      }
     }
   );
 
   // ── UI helpers ─────────────────────────────────────────────────────────────
+
+  const TOOL_DISPLAY = {
+    search_page: 'Searching page',
+    summarize_page: 'Reading page',
+    web_search: 'Searching web',
+    COMPOSIO_SEARCH_TOOLS: 'Finding tools',
+    COMPOSIO_CHECK_ACTIVE_CONNECTIONS: 'Checking connections',
+    COMPOSIO_INITIATE_CONNECTION: 'Connecting',
+    COMPOSIO_EXECUTE_ACTION: 'Executing action',
+    COMPOSIO_MANAGE_CONNECTIONS: 'Managing connections',
+    COMPOSIO_MULTI_EXECUTE_TOOL: 'Executing tools',
+  };
 
   function showThinking() {
     responseArea.classList.add('visible');
@@ -217,49 +279,38 @@ document.addEventListener('DOMContentLoaded', () => {
     const wrap = document.createElement('div');
     wrap.className = 'chat-msg ai';
     wrap.id        = 'chatTyping';
-    wrap.innerHTML = `<div class="chat-avatar ai-av">${AI_AVATAR_SVG}</div><div class="chat-bubble ai-bubble whispering-bubble"><span class="whispering-label">Whispering</span>${TYPING_SVG}</div>`;
+    wrap.innerHTML = `<div class="chat-avatar ai-av thinking">${AI_AVATAR_SVG}</div><div class="chat-bubble ai-bubble whispering-bubble"><span class="whispering-label">Whispering</span>${TYPING_SVG}</div>`;
     chatHistory.appendChild(wrap);
     chatHistory.scrollTop = chatHistory.scrollHeight;
   }
 
-  function startAnswer(toolName, usedRag, isYoutube) {
+  function updateThinking(toolName) {
+    const label = document.querySelector('#chatTyping .whispering-label');
+    if (label) {
+      label.textContent = TOOL_DISPLAY[toolName] || toolName;
+      chatHistory.scrollTop = chatHistory.scrollHeight;
+    }
+  }
+
+  function startAnswer() {
     document.getElementById('chatTyping')?.remove();
     const wrap = document.createElement('div');
     wrap.className = 'chat-msg ai';
 
-    if (toolName === 'solve_code') {
-      const codeBubble = document.createElement('div');
-      codeBubble.className = 'code-bubble';
-      codeBubble.innerHTML = `<pre><code></code></pre><button class="inject-btn" disabled>Inject into editor →</button>`;
-      wrap.innerHTML = `<div class="chat-avatar ai-av">${AI_AVATAR_SVG}</div>`;
-      wrap.appendChild(codeBubble);
-      chatHistory.appendChild(wrap);
-      chatHistory.scrollTop = chatHistory.scrollHeight;
-      currentStreamEl = codeBubble.querySelector('code');
-      codeBubble.querySelector('.inject-btn').addEventListener('click', (e) => handleInject(e.currentTarget));
-    } else {
-      const bubble = document.createElement('div');
-      bubble.className = 'chat-bubble ai-bubble';
-      if (CODE_TOOLS.has(toolName)) {
-        const badge = document.createElement('span');
-        badge.className   = 'source-badge';
-        badge.textContent = TOOL_LABELS[toolName] || 'Answer';
-        bubble.appendChild(badge);
-      } else if (usedRag) {
-        const badge = document.createElement('span');
-        badge.className   = 'source-badge';
-        badge.textContent = isYoutube ? '🎬 from video' : '📄 from page';
-        bubble.appendChild(badge);
-      }
-      // Separate text container so badge is never overwritten by streaming innerHTML
-      const textEl = document.createElement('div');
-      bubble.appendChild(textEl);
-      wrap.innerHTML = `<div class="chat-avatar ai-av">${AI_AVATAR_SVG}</div>`;
-      wrap.appendChild(bubble);
-      chatHistory.appendChild(wrap);
-      chatHistory.scrollTop = chatHistory.scrollHeight;
-      currentStreamEl = textEl;
-    }
+    const bubble = document.createElement('div');
+    bubble.className = 'chat-bubble ai-bubble';
+    const textEl = document.createElement('div');
+    bubble.appendChild(textEl);
+    wrap.innerHTML = `<div class="chat-avatar ai-av thinking" id="streamingAvatar">${AI_AVATAR_SVG}</div>`;
+    wrap.appendChild(bubble);
+    chatHistory.appendChild(wrap);
+    chatHistory.scrollTop = chatHistory.scrollHeight;
+    currentStreamEl = textEl;
+  }
+
+  function stopAnswerSpin() {
+    const av = document.getElementById('streamingAvatar');
+    if (av) { av.classList.remove('thinking'); av.removeAttribute('id'); }
   }
 
   function showError(text) {
@@ -275,55 +326,6 @@ document.addEventListener('DOMContentLoaded', () => {
 
   function escHtml(s) {
     return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-  }
-
-  // ── Inject handler ─────────────────────────────────────────────────────────
-
-  async function handleInject(btn) {
-    const code = btn.dataset.finalCode;
-    if (!code) return;
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      world:  'MAIN',
-      func: (c) => {
-        try {
-          if (window.monaco?.editor) {
-            const models = window.monaco.editor.getModels();
-            if (models.length > 0) { models[0].setValue(c); return { ok: true }; }
-          }
-        } catch (_) {}
-        try {
-          const ta = document.querySelector('.monaco-editor textarea');
-          if (ta) { ta.focus(); document.execCommand('selectAll'); if (document.execCommand('insertText', false, c)) return { ok: true }; }
-        } catch (_) {}
-        try {
-          const el = document.querySelector('.monaco-editor');
-          if (el) {
-            const k = Object.keys(el).find(k => k.startsWith('__reactFiber') || k.startsWith('__reactInternalInstance'));
-            if (k) {
-              let f = el[k], d = 0;
-              while (f && d < 200) {
-                if (f.stateNode?.editor?.setValue) { f.stateNode.editor.setValue(c); return { ok: true }; }
-                f = f.return; d++;
-              }
-            }
-          }
-        } catch (_) {}
-        return { ok: false, error: 'Could not find Monaco editor.' };
-      },
-      args: [code],
-    }, (results) => {
-      const res = results?.[0]?.result;
-      if (chrome.runtime.lastError || !res?.ok) {
-        btn.textContent = '✗ Inject failed — ' + (res?.error || chrome.runtime.lastError?.message || 'unknown');
-        btn.classList.add('inject-fail');
-      } else {
-        btn.textContent = '✓ Injected!';
-        btn.classList.add('inject-done');
-        btn.disabled = true;
-      }
-    });
   }
 
   // ── Provider / model buttons ───────────────────────────────────────────────
@@ -361,8 +363,9 @@ document.addEventListener('DOMContentLoaded', () => {
           action: () => { hideOverlay(); chrome.runtime.openOptionsPage(); },
         },
         {
-          icon: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>`,
-          label: 'About Us', sub: 'Coming soon', disabled: true,
+          icon: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2m3 0v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6"/></svg>`,
+          label: 'Clear Chat', sub: 'Start a new conversation',
+          action: () => { clearChat(); hideOverlay(); },
         },
       ];
 
@@ -465,32 +468,16 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // ── Context fetching ───────────────────────────────────────────────────────
 
-  function getPageChunks(tab, cb) {
+  function getPageText(tab, cb) {
     chrome.tabs.sendMessage(tab.id, { type: 'GET_PAGE_DATA' }, (res) => {
       if (chrome.runtime.lastError || !res) {
         chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] }, () => {
           if (chrome.runtime.lastError) { showError('Cannot access this page (try a regular http/https page).'); return; }
-          chrome.tabs.sendMessage(tab.id, { type: 'GET_PAGE_DATA' }, (r2) => cb(r2?.chunks || null));
+          chrome.tabs.sendMessage(tab.id, { type: 'GET_PAGE_DATA' }, (r2) => cb(r2?.text || ''));
         });
         return;
       }
-      cb(res?.chunks || null);
-    });
-  }
-
-  function getContextData(tab, onReady) {
-    const isYT = tab.url?.includes('youtube.com/watch');
-    getPageChunks(tab, (chunks) => {
-      if (!isYT) { onReady(chunks, null); return; }
-      chrome.tabs.sendMessage(tab.id, { type: 'GET_YOUTUBE_DATA' }, (ytRes) => {
-        if (chrome.runtime.lastError || !ytRes) {
-          chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] }, () => {
-            chrome.tabs.sendMessage(tab.id, { type: 'GET_YOUTUBE_DATA' }, (ytRes2) => onReady(chunks, ytRes2));
-          });
-          return;
-        }
-        onReady(chunks, ytRes);
-      });
+      cb(res?.text || '');
     });
   }
 
@@ -500,31 +487,27 @@ document.addEventListener('DOMContentLoaded', () => {
     const key = savedApiKeys[selectedProvider];
     if (!key) { showError('No API key for this provider. Open Settings (⚙).'); return; }
 
-    async function doFetch(chunks, youtube, lcData) {
-      const leetcode = lcData?.description ? {
-        title:        lcData.title,
-        description:  lcData.description,
-        language:     lcData.language || 'Python3',
-        current_code: lcData.currentCode || null,
-      } : null;
-
+    getPageText(tab, async (text) => {
       activeController = new AbortController();
       setStopMode(true);
 
       let response;
       try {
-        response = await fetch(`${BACKEND}/chat`, {
+        const payload = {
+            query,
+            text:       text || '',
+            model:      selectedModel?.id,
+            history:    chatMessages.slice(0, -1),
+            tool_keys:  savedToolKeys,
+          };
+          if (selectedProvider === 'claude' && savedApiKeys.gemini)
+            payload.gemini_key = savedApiKeys.gemini;
+
+          response = await fetch(`${BACKEND}/chat`, {
           method:  'POST',
           headers: { 'Content-Type': 'application/json', 'Token': key, 'Provider': selectedProvider },
           signal:  activeController.signal,
-          body: JSON.stringify({
-            query,
-            chunks:   chunks || [],
-            model:    selectedModel?.id,
-            history:  chatMessages.slice(0, -1),
-            youtube,
-            leetcode,
-          }),
+          body: JSON.stringify(payload),
         });
       } catch (err) {
         setStopMode(false);
@@ -539,53 +522,25 @@ document.addEventListener('DOMContentLoaded', () => {
         return;
       }
 
-      let fullText = '', toolName = null, usedRag = false, isYoutube = false, started = false;
+      let fullText = '', started = false;
 
       await readSSEStream(response, {
-        onMeta: (parsed) => { toolName = parsed.tool; usedRag = parsed.used_rag; isYoutube = parsed.is_youtube; },
+        onMeta: () => {},
+        onTool: (name) => { updateThinking(name); },
         onText: (text) => {
-          if (!started) { started = true; startAnswer(toolName, usedRag, isYoutube); }
+          if (!started) { started = true; startAnswer(); }
           fullText += text;
-          if (toolName === 'solve_code') {
-            currentStreamEl.textContent = fullText.replace(/^```[\w]*\n?/, '').replace(/\n?```$/, '');
-            currentStreamEl.closest('pre').scrollTop = currentStreamEl.closest('pre').scrollHeight;
-          } else {
-            currentStreamEl.innerHTML = renderMarkdown(fullText);
-            chatHistory.scrollTop = chatHistory.scrollHeight;
-          }
+          currentStreamEl.innerHTML = renderMarkdown(fullText);
+          chatHistory.scrollTop = chatHistory.scrollHeight;
         },
         onError: (msg) => { if (!activeController?.signal.aborted) showError(msg); },
       });
 
+      stopAnswerSpin();
       setStopMode(false);
-
-      if (toolName === 'solve_code' && fullText) {
-        const finalCode = fullText.replace(/^```[\w]*\n?/, '').replace(/\n?```$/, '');
-        const injectBtn = currentStreamEl?.closest('.code-bubble')?.querySelector('.inject-btn');
-        if (injectBtn) { injectBtn.dataset.finalCode = finalCode; injectBtn.disabled = false; }
-      }
-
-      if (fullText) chatMessages.push({ role: 'assistant', content: fullText });
-    }
-
-    getContextData(tab, async (chunks, ytData) => {
-      const youtube = ytData?.videoId
-        ? { video_id: ytData.videoId, current_time: ytData.currentTime ?? null }
-        : null;
-
-      if (tab.url?.match(CODE_SITE_RE)) {
-        chrome.tabs.sendMessage(tab.id, { type: 'GET_LEETCODE_DATA' }, async (lcRes) => {
-          if (chrome.runtime.lastError || !lcRes) {
-            chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] }, () => {
-              if (chrome.runtime.lastError) { showError('Cannot access this page.'); return; }
-              chrome.tabs.sendMessage(tab.id, { type: 'GET_LEETCODE_DATA' }, (lcRes2) => doFetch(chunks, youtube, lcRes2));
-            });
-            return;
-          }
-          await doFetch(chunks, youtube, lcRes);
-        });
-      } else {
-        await doFetch(chunks, youtube, null);
+      if (fullText) {
+        chatMessages.push({ role: 'assistant', content: fullText });
+        saveChat();
       }
     });
   }
@@ -632,6 +587,7 @@ document.addEventListener('DOMContentLoaded', () => {
       chatHistory.appendChild(userWrap);
       chatHistory.scrollTop = chatHistory.scrollHeight;
       chatMessages.push({ role: 'user', content: query });
+      saveChat(tab.url);
 
       showThinking();
       handleQuery(tab, query);

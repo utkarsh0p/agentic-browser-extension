@@ -18,7 +18,7 @@ body {
 
 .container {
   background: #ffffff;
-  width: 480px;
+  width: 860px;
   padding: 28px 28px 24px;
   border-radius: 18px;
   box-shadow: 0 4px 28px rgba(0, 0, 0, 0.08);
@@ -52,12 +52,32 @@ h2 {
   margin-top: 2px;
 }
 
+/* ── Two-column layout ── */
+.columns {
+  display: flex;
+  gap: 20px;
+  margin-bottom: 20px;
+}
+
+.column {
+  flex: 1;
+  min-width: 0;
+}
+
+.col-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: #777770;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 10px;
+}
+
 /* ── Provider rows ── */
 .providers {
   display: flex;
   flex-direction: column;
   gap: 10px;
-  margin-bottom: 20px;
 }
 
 .provider-row {
@@ -92,9 +112,11 @@ h2 {
   text-align: center;
 }
 
-.claude-icon  { color: #c96442; }
-.gemini-icon  { color: #4285f4; }
-.openai-icon  { color: #10a37f; }
+.claude-icon   { color: #c96442; }
+.gemini-icon   { color: #4285f4; }
+.openai-icon   { color: #10a37f; }
+.tavily-icon   { color: #0066ff; font-weight: 700; font-size: 16px; }
+.composio-icon { color: #7c3aed; font-weight: 700; font-size: 16px; }
 
 .prov-meta {
   display: flex;

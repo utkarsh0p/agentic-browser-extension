@@ -13,14 +13,13 @@
 
   "permissions": [
     "activeTab",
-    "tabs",
     "storage",
     "scripting"
   ],
 
   "host_permissions": [
     "<all_urls>",
-    "http://localhost:5000/*"
+    "http://147.93.169.144:5000/*"
   ],
 
   "action": {
