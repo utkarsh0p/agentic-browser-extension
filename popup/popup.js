@@ -471,10 +471,7 @@ document.addEventListener('DOMContentLoaded', () => {
   function getPageText(tab, cb) {
     chrome.tabs.sendMessage(tab.id, { type: 'GET_PAGE_DATA' }, (res) => {
       if (chrome.runtime.lastError || !res) {
-        chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] }, () => {
-          if (chrome.runtime.lastError) { showError('Cannot access this page (try a regular http/https page).'); return; }
-          chrome.tabs.sendMessage(tab.id, { type: 'GET_PAGE_DATA' }, (r2) => cb(r2?.text || ''));
-        });
+        showError('Cannot access this page (try a regular http/https page).');
         return;
       }
       cb(res?.text || '');
