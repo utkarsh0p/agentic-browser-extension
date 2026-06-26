@@ -36,4 +36,4 @@ SiteWhisper does not sell, share, or transfer user data to any third party for a
 
 ## Contact
 
-If you have questions about this privacy policy, contact: utkarshdevendrasingh@gmail.com
+If you have questions about this privacy policy, contact: u0p@vorldx.com

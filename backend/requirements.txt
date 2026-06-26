@@ -1,0 +1,25 @@
+# ── Web server ────────────────────────────────────────────────────────────────
+fastapi
+uvicorn[standard]
+
+# ── Vector search ─────────────────────────────────────────────────────────────
+scikit-learn
+
+# ── LangChain + LangGraph ─────────────────────────────────────────────────────
+langchain
+langchain-core
+langchain-text-splitters
+langgraph
+
+# ── Provider: OpenAI ──────────────────────────────────────────────────────────
+langchain-openai
+
+# ── Provider: Google Gemini ───────────────────────────────────────────────────
+langchain-google-genai
+
+# ── Provider: Anthropic Claude ────────────────────────────────────────────────
+langchain-anthropic
+
+# ── External tools ────────────────────────────────────────────────────────────
+tavily-python
+composio-langchain
