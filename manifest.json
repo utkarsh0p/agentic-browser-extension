@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "SiteWhisper",
-  "version": "1.0",
-  "description": "Ask questions about any webpage using AI",
+  "version": "1.1",
+  "description": "Chat with any webpage — AI reads the page content, finds relevant sections, and answers your questions using Claude, Gemini, or GPT.",
 
   "icons": {
     "16":  "icons/icon16.png",
@@ -18,7 +18,6 @@
   ],
 
   "host_permissions": [
-    "<all_urls>",
     "http://147.93.169.144:5000/*"
   ],
 
