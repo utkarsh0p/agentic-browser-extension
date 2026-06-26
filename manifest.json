@@ -18,7 +18,7 @@
   ],
 
   "host_permissions": [
-    "http://147.93.169.144:5000/*"
+    "https://api.cember.in/*"
   ],
 
   "action": {

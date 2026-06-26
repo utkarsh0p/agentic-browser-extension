@@ -1,6 +1,6 @@
 // ── Backend URL — toggle one line to switch between local and production ──────
-const BACKEND = 'http://localhost:5000';        // ← local testing
-// const BACKEND = 'http://147.93.169.144:5000';    // ← production
+// const BACKEND = 'http://localhost:5000';        // ← local testing
+const BACKEND = 'https://api.cember.in';          // ← production
 
 // ── Avatars ───────────────────────────────────────────────────────────────────
 
