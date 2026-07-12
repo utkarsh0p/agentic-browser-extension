@@ -46,7 +46,12 @@
       </button>
     </div>
 
-    <!-- ── Input card ── -->
+    <!-- ── Response area (grows to fill; pushes the input to the bottom) ── -->
+    <div class="response-area" id="responseArea">
+      <div class="chat-history" id="chatHistory"></div>
+    </div>
+
+    <!-- ── Input card (docks to the bottom once chatting) ── -->
     <div class="input-area">
       <div class="input-card">
         <textarea
@@ -88,11 +93,6 @@
           </button>
         </div>
       </div>
-    </div>
-
-    <!-- ── Response area ── -->
-    <div class="response-area" id="responseArea">
-      <div class="chat-history" id="chatHistory"></div>
     </div>
 
     <!-- ── Full-screen selector overlay ── -->

@@ -1,6 +1,6 @@
 // ── Backend URL — toggle one line to switch between local and production ──────
-// const BACKEND = 'http://localhost:5000';        // ← local testing
-const BACKEND = 'https://api.cember.in';          // ← production
+const BACKEND = 'http://localhost:5000';        // ← local testing
+// const BACKEND = 'https://api.cember.in';          // ← production
 
 // ── Avatars ───────────────────────────────────────────────────────────────────
 
@@ -83,10 +83,58 @@ const CLAUDE_ICON = `<svg fill="#c96442" fill-rule="evenodd" width="13" height="
 // ── Provider & model metadata ──────────────────────────────────────────────────
 
 const PROVIDERS = {
-  claude: { label: 'Claude', sub: 'Anthropic', icon: CLAUDE_ICON },
-  gemini: { label: 'Gemini', sub: 'Google',    icon: GEMINI_ICON },
-  openai: { label: 'GPT',    sub: 'OpenAI',    icon: OPENAI_ICON },
+  claude: { label: 'Claude', sub: 'Anthropic', icon: CLAUDE_ICON, accent: '#c96442' },
+  gemini: { label: 'Gemini', sub: 'Google',    icon: GEMINI_ICON, accent: '#1c69ff' },
+  openai: { label: 'GPT',    sub: 'OpenAI',    icon: OPENAI_ICON, accent: '#10a37f' },
 };
+
+// ── Small pure helpers (reasoning trace + card chrome) ──────────────────────────
+
+function formatTime(ts) {
+  if (!ts) return '';
+  try { return new Date(ts).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }); }
+  catch { return ''; }
+}
+
+// Whisper-voice labels for the reasoning rail
+const TOOL_DISPLAY = {
+  search_page:                        'Searching the page',
+  summarize_page:                     'Reading the page',
+  web_search:                         'Searching the web',
+  COMPOSIO_SEARCH_TOOLS:              'Finding tools',
+  COMPOSIO_CHECK_ACTIVE_CONNECTIONS:  'Checking connections',
+  COMPOSIO_INITIATE_CONNECTION:       'Connecting',
+  COMPOSIO_EXECUTE_ACTION:            'Taking action',
+  COMPOSIO_MANAGE_CONNECTIONS:        'Managing connections',
+  COMPOSIO_MULTI_EXECUTE_TOOL:        'Running tools',
+};
+
+function toolLabel(name) {
+  if (TOOL_DISPLAY[name]) return TOOL_DISPLAY[name];
+  return (name || 'Working')
+    .replace(/^COMPOSIO_/, '')
+    .replace(/_/g, ' ')
+    .toLowerCase()
+    .replace(/^./, c => c.toUpperCase());
+}
+
+// Pull a human-readable input (usually the query) from a tool's args
+function argPreview(args) {
+  if (!args || typeof args !== 'object') return '';
+  const v = args.query ?? args.q ?? args.input ?? args.text
+    ?? Object.values(args).find(x => typeof x === 'string');
+  if (typeof v !== 'string' || !v.trim()) return '';
+  return v.length > 64 ? v.slice(0, 64) + '…' : v;
+}
+
+// Tool outputs are often raw JSON — never dump that into the trace.
+function cleanResult(s) {
+  s = (s || '').replace(/\s+/g, ' ').trim();
+  if (!s) return '';
+  if (/^[[{]/.test(s)) return '';                             // JSON blob
+  if (((s.match(/[{}[\]"]/g) || []).length) > 4) return '';   // looks structured
+  return s.length > 80 ? s.slice(0, 80) + '…' : s;
+}
 
 const PROVIDER_ORDER = ['claude', 'gemini', 'openai'];
 
@@ -110,7 +158,7 @@ const MODELS = {
 
 // ── Shared SSE stream reader ───────────────────────────────────────────────────
 
-async function readSSEStream(response, { onText, onMeta, onError, onTool }) {
+async function readSSEStream(response, { onText, onMeta, onError, onTool, onToolResult }) {
   const reader  = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
@@ -127,10 +175,11 @@ async function readSSEStream(response, { onText, onMeta, onError, onTool }) {
         if (raw === '[DONE]') return;
         try {
           const parsed = JSON.parse(raw);
-          if (parsed.error)                            { onError?.(parsed.error); return; }
-          if (parsed.status)                              { onMeta?.(parsed); continue; }
-          if (parsed.tool)                               { onTool?.(parsed.tool); continue; }
-          if (parsed.text)                               onText?.(parsed.text);
+          if (parsed.error)       { onError?.(parsed.error); return; }
+          if (parsed.status)      { onMeta?.(parsed); continue; }
+          if (parsed.tool)        { onTool?.(parsed.tool); continue; }
+          if (parsed.tool_result) { onToolResult?.(parsed.tool_result); continue; }
+          if (parsed.text)        onText?.(parsed.text);
         } catch { /* skip malformed line */ }
       }
     }
@@ -147,6 +196,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const settingsBtn  = document.getElementById('settingsBtn');
   const responseArea = document.getElementById('responseArea');
   const chatHistory  = document.getElementById('chatHistory');
+  const shell        = document.querySelector('.popup-shell');
 
   // Overlay elements
   const overlay      = document.getElementById('overlay');
@@ -171,7 +221,6 @@ document.addEventListener('DOMContentLoaded', () => {
   let savedApiKeys      = {};
   let savedToolKeys     = {};
   let chatMessages      = [];
-  let currentStreamEl   = null;
   let activeController  = null;
 
   const STOP_ICON = `<svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>`;
@@ -182,6 +231,22 @@ document.addEventListener('DOMContentLoaded', () => {
     askBtn.innerHTML = on ? STOP_ICON : SEND_ICON;
     askBtn.classList.toggle('stop-mode', on);
     if (!on) askBtn.disabled = !input.value.trim();
+  }
+
+  // ── Window grow + input-dock transition ───────────────────────────────────
+  const ACTIVE_H = 500;   // conversing window height (px) — tune to taste
+
+  function setChatting(animate) {
+    if (shell.classList.contains('chatting')) return;
+    const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    if (animate && !reduce) {
+      shell.style.height = shell.offsetHeight + 'px';        // pin current height
+      shell.classList.add('chatting');
+      requestAnimationFrame(() => { shell.style.height = ACTIVE_H + 'px'; });  // → animate grow
+    } else {
+      shell.classList.add('chatting');
+      shell.style.height = ACTIVE_H + 'px';
+    }
   }
 
   // ── Chat persistence ────────────────────────────────────────────────────
@@ -195,26 +260,54 @@ document.addEventListener('DOMContentLoaded', () => {
   function loadChat(saved) {
     if (!saved || saved.length === 0) return;
     chatMessages = saved;
+    setChatting(false);   // already a conversation → open tall, no grow animation
     responseArea.classList.add('visible');
     chatHistory.classList.add('visible');
     for (const msg of chatMessages) {
-      const wrap = document.createElement('div');
       if (msg.role === 'user') {
+        const wrap = document.createElement('div');
         wrap.className = 'chat-msg user';
         wrap.innerHTML = `<div class="chat-bubble user-bubble">${escHtml(msg.content)}</div><div class="chat-avatar user-av">${USER_AVATAR_SVG}</div>`;
+        chatHistory.appendChild(wrap);
       } else {
-        wrap.className = 'chat-msg ai';
-        const bubble = document.createElement('div');
-        bubble.className = 'chat-bubble ai-bubble';
-        const textEl = document.createElement('div');
-        textEl.innerHTML = renderMarkdown(msg.content);
-        bubble.appendChild(textEl);
-        wrap.innerHTML = `<div class="chat-avatar ai-av">${AI_AVATAR_SVG}</div>`;
-        wrap.appendChild(bubble);
+        chatHistory.appendChild(renderStoredAiTurn(msg));
       }
-      chatHistory.appendChild(wrap);
     }
     chatHistory.scrollTop = chatHistory.scrollHeight;
+  }
+
+  // Rebuild a completed AI turn (folded rail + answer card) from a stored message
+  function renderStoredAiTurn(msg) {
+    const wrap = document.createElement('div');
+    wrap.className = 'chat-msg ai';
+    const turnEl = document.createElement('div');
+    turnEl.className = 'ai-turn';
+    if (msg.provider && PROVIDERS[msg.provider])
+      turnEl.style.setProperty('--accent', PROVIDERS[msg.provider].accent);
+
+    const steps = Array.isArray(msg.steps) ? msg.steps : [];
+    if (steps.length) {
+      const rail = document.createElement('div');
+      rail.className = 'whisper-rail';
+      let toolCount = 0;
+      for (const s of steps) {
+        if (s.kind === 'tool') {
+          rail.appendChild(railToolEl(s.name, s.argPreview, { done: true, summary: s.summary || '' }));
+          toolCount++;
+        } else if (s.kind === 'reason' && s.text) {
+          rail.appendChild(railReasonEl(s.text));
+        }
+      }
+      turnEl.appendChild(rail);
+      foldRail(turnEl, rail, toolCount || steps.length, msg.durationMs);
+    }
+
+    const { card, body } = makeCard(msg.provider, msg.model);
+    body.innerHTML = renderMarkdown(msg.content || '');
+    turnEl.appendChild(card);
+    addCardFooter(card, msg.ts, msg.content || '');
+    wrap.appendChild(turnEl);
+    return wrap;
   }
 
   function clearChat() {
@@ -222,6 +315,8 @@ document.addEventListener('DOMContentLoaded', () => {
     chatHistory.innerHTML = '';
     responseArea.classList.remove('visible');
     chatHistory.classList.remove('visible');
+    shell.classList.remove('chatting');
+    shell.style.height = '';                 // back to the compact empty state
     chrome.storage.local.remove('chatMessages');
   }
 
@@ -261,71 +356,225 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // ── UI helpers ─────────────────────────────────────────────────────────────
 
-  const TOOL_DISPLAY = {
-    search_page: 'Searching page',
-    summarize_page: 'Reading page',
-    web_search: 'Searching web',
-    COMPOSIO_SEARCH_TOOLS: 'Finding tools',
-    COMPOSIO_CHECK_ACTIVE_CONNECTIONS: 'Checking connections',
-    COMPOSIO_INITIATE_CONNECTION: 'Connecting',
-    COMPOSIO_EXECUTE_ACTION: 'Executing action',
-    COMPOSIO_MANAGE_CONNECTIONS: 'Managing connections',
-    COMPOSIO_MULTI_EXECUTE_TOOL: 'Executing tools',
-  };
-
-  function showThinking() {
-    responseArea.classList.add('visible');
-    chatHistory.classList.add('visible');
-    const wrap = document.createElement('div');
-    wrap.className = 'chat-msg ai';
-    wrap.id        = 'chatTyping';
-    wrap.innerHTML = `<div class="chat-avatar ai-av thinking">${AI_AVATAR_SVG}</div><div class="chat-bubble ai-bubble whispering-bubble"><span class="whispering-label">Whispering</span>${TYPING_SVG}</div>`;
-    chatHistory.appendChild(wrap);
-    chatHistory.scrollTop = chatHistory.scrollHeight;
-  }
-
-  function updateThinking(toolName) {
-    const label = document.querySelector('#chatTyping .whispering-label');
-    if (label) {
-      label.textContent = TOOL_DISPLAY[toolName] || toolName;
-      chatHistory.scrollTop = chatHistory.scrollHeight;
-    }
-  }
-
-  function startAnswer() {
-    document.getElementById('chatTyping')?.remove();
-    const wrap = document.createElement('div');
-    wrap.className = 'chat-msg ai';
-
-    const bubble = document.createElement('div');
-    bubble.className = 'chat-bubble ai-bubble';
-    const textEl = document.createElement('div');
-    bubble.appendChild(textEl);
-    wrap.innerHTML = `<div class="chat-avatar ai-av thinking" id="streamingAvatar">${AI_AVATAR_SVG}</div>`;
-    wrap.appendChild(bubble);
-    chatHistory.appendChild(wrap);
-    chatHistory.scrollTop = chatHistory.scrollHeight;
-    currentStreamEl = textEl;
-  }
-
-  function stopAnswerSpin() {
-    const av = document.getElementById('streamingAvatar');
-    if (av) { av.classList.remove('thinking'); av.removeAttribute('id'); }
-  }
-
-  function showError(text) {
-    document.getElementById('chatTyping')?.remove();
-    responseArea.classList.add('visible');
-    chatHistory.classList.add('visible');
-    const wrap = document.createElement('div');
-    wrap.className = 'chat-msg ai';
-    wrap.innerHTML = `<div class="chat-avatar ai-av">${AI_AVATAR_SVG}</div><div class="chat-bubble ai-bubble error">${escHtml(text)}</div>`;
-    chatHistory.appendChild(wrap);
-    chatHistory.scrollTop = chatHistory.scrollHeight;
-  }
+  const TICK_ICON    = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>`;
+  const CHEVRON_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg>`;
+  const COPY_ICON    = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>`;
 
   function escHtml(s) {
     return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+
+  function scrollToEnd() { chatHistory.scrollTop = chatHistory.scrollHeight; }
+
+  // ── Card + rail builders (shared by live streaming and history replay) ───────
+
+  function cardHeaderHTML(provider, model) {
+    const prov = provider && PROVIDERS[provider];
+    if (prov) {
+      const meta = model ? `${prov.label} · ${model}` : prov.label;
+      return `<span class="ai-card-ic">${prov.icon}</span><span class="ai-card-meta">${escHtml(meta)}</span>`;
+    }
+    return `<span class="ai-card-ic sw">${AI_AVATAR_SVG}</span><span class="ai-card-meta">SiteWhisper</span>`;
+  }
+
+  function makeCard(provider, model) {
+    const card = document.createElement('div');
+    card.className = 'ai-card';
+    const header = document.createElement('div');
+    header.className = 'ai-card-header';
+    header.innerHTML = cardHeaderHTML(provider, model);
+    const body = document.createElement('div');
+    body.className = 'ai-card-body';
+    card.append(header, body);
+    return { card, body };
+  }
+
+  function addCardFooter(card, ts, rawText) {
+    const footer = document.createElement('div');
+    footer.className = 'ai-card-footer';
+    const time = document.createElement('span');
+    time.className = 'ai-time';
+    time.textContent = formatTime(ts);
+    const copy = document.createElement('button');
+    copy.type = 'button';
+    copy.className = 'copy-btn';
+    copy.innerHTML = `${COPY_ICON}<span>Copy</span>`;
+    copy.addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(rawText || '');
+        copy.classList.add('copied');
+        copy.querySelector('span').textContent = 'Copied';
+        setTimeout(() => {
+          copy.classList.remove('copied');
+          const s = copy.querySelector('span'); if (s) s.textContent = 'Copy';
+        }, 1400);
+      } catch { /* clipboard blocked — ignore */ }
+    });
+    footer.append(time, copy);
+    card.appendChild(footer);
+  }
+
+  function railReasonEl(text) {
+    const el = document.createElement('div');
+    el.className = 'rail-step reason';
+    el.innerHTML = `<span class="rail-dot"></span><span class="rail-body"><span class="rail-reason"></span></span>`;
+    el.querySelector('.rail-reason').textContent = text;
+    return el;
+  }
+
+  function railToolEl(name, argp, { done = false } = {}) {
+    const el = document.createElement('div');
+    el.className = 'rail-step tool' + (done ? ' done' : ' active');
+    el.innerHTML =
+      `<span class="rail-dot">${done ? TICK_ICON : ''}</span>` +
+      `<span class="rail-body">` +
+        `<span class="rail-tool-label">${escHtml(toolLabel(name))}</span>` +
+        (argp ? `<span class="rail-arg">${escHtml(argp)}</span>` : '') +
+      `</span>`;
+    return el;
+  }
+
+  // Collapse a finished rail into a "Whispered through N steps · Ns" chip
+  function foldRail(turnEl, railEl, stepCount, durationMs) {
+    const secs = durationMs ? Math.max(1, Math.round(durationMs / 1000)) : null;
+    const chip = document.createElement('button');
+    chip.type = 'button';
+    chip.className = 'trace-chip';
+    const label = `Whispered through ${stepCount} step${stepCount === 1 ? '' : 's'}${secs ? ` · ${secs}s` : ''}`;
+    chip.innerHTML = `<span class="chip-chev">${CHEVRON_ICON}</span><span>${escHtml(label)}</span>`;
+    railEl.classList.add('collapsed');
+    chip.addEventListener('click', () => {
+      const open = railEl.classList.toggle('open');
+      chip.classList.toggle('open', open);
+    });
+    turnEl.insertBefore(chip, railEl);
+  }
+
+  // Live streaming controller for one AI turn (reasoning rail + answer card)
+  function createAiTurn(provider, model) {
+    responseArea.classList.add('visible');
+    chatHistory.classList.add('visible');
+
+    const wrap = document.createElement('div');
+    wrap.className = 'chat-msg ai';
+    const turnEl = document.createElement('div');
+    turnEl.className = 'ai-turn';
+    if (provider && PROVIDERS[provider]) turnEl.style.setProperty('--accent', PROVIDERS[provider].accent);
+
+    const rail = document.createElement('div');
+    rail.className = 'whisper-rail';
+    const waiting = document.createElement('div');
+    waiting.className = 'rail-step reason active waiting';
+    waiting.innerHTML = `<span class="rail-dot"></span><span class="rail-body"><span class="whispering-label">Whispering</span>${TYPING_SVG}</span>`;
+    rail.appendChild(waiting);
+
+    const { card, body } = makeCard(provider, model);
+    card.style.display = 'none';   // revealed once real answer text streams in
+
+    turnEl.append(rail, card);
+    wrap.appendChild(turnEl);
+    chatHistory.appendChild(wrap);
+    scrollToEnd();
+
+    const startTs = Date.now();
+    const steps   = [];         // persisted: {kind:'reason'|'tool', ...}
+    const toolEls = {};         // tool id -> { el, item }
+    let answer    = '';         // provisional final-answer markdown
+    let toolCount = 0;
+
+    const dropWaiting = () => { waiting.remove(); };
+    // Any text collected in the answer body before a tool call was actually reasoning
+    function flushAnswerAsReason() {
+      const t = answer.trim();
+      if (t) {
+        steps.push({ kind: 'reason', text: t });
+        rail.appendChild(railReasonEl(t));
+      }
+      answer = '';
+      body.innerHTML = '';
+      card.style.display = 'none';
+    }
+
+    return {
+      onText(delta) {
+        dropWaiting();
+        answer += delta;
+        card.style.display = '';
+        body.innerHTML = renderMarkdown(answer);
+        scrollToEnd();
+      },
+      onTool(tool) {
+        dropWaiting();
+        flushAnswerAsReason();
+        // Accept both the new object form {name,args,id} and the legacy string form
+        const isObj = tool && typeof tool === 'object';
+        const name  = isObj ? tool.name : tool;
+        const argp  = argPreview(isObj ? tool.args : null);
+        const item  = { kind: 'tool', name, argPreview: argp, summary: '' };
+        steps.push(item);
+        const el = railToolEl(name, argp);
+        rail.appendChild(el);
+        if (isObj && tool.id != null) toolEls[tool.id] = { el, item };
+        toolCount++;
+        scrollToEnd();
+      },
+      onToolResult(res) {
+        const ref = res && res.id != null ? toolEls[res.id] : null;
+        const short = cleanResult(res && res.summary);
+        if (ref) {
+          ref.item.summary = short;
+          ref.el.classList.remove('active');
+          ref.el.classList.add('done');
+          ref.el.querySelector('.rail-dot').innerHTML = TICK_ICON;
+          if (short) ref.el.querySelector('.rail-result').textContent = short;
+        }
+        scrollToEnd();
+      },
+      // Finalize: fold the rail, stamp footer, return the record to persist
+      finish() {
+        dropWaiting();
+        // Resolve any tool still shown as running (e.g. a backend that never sent tool_result)
+        rail.querySelectorAll('.rail-step.tool.active').forEach(el => {
+          el.classList.remove('active');
+          el.classList.add('done');
+          el.querySelector('.rail-dot').innerHTML = TICK_ICON;
+        });
+        const durationMs = Date.now() - startTs;
+        const ts = Date.now();
+        if (toolCount > 0 || steps.length > 0) {
+          foldRail(turnEl, rail, toolCount || steps.length, durationMs);
+        } else {
+          rail.remove();
+        }
+        card.style.display = '';
+        if (!answer.trim()) body.innerHTML = `<p class="ai-empty">Done.</p>`;
+        addCardFooter(card, ts, answer);
+        scrollToEnd();
+        return { content: answer, provider, model, ts, durationMs, steps };
+      },
+      fail(text) {
+        dropWaiting();
+        rail.remove();
+        card.style.display = '';
+        body.className = 'ai-card-body error';
+        body.textContent = text;
+        scrollToEnd();
+      },
+      discard() { wrap.remove(); },
+      hasAnswer() { return !!answer.trim(); },
+      hasSteps()  { return steps.length > 0; },
+    };
+  }
+
+  // Standalone error bubble (used before a turn exists, e.g. missing key)
+  function showError(text) {
+    responseArea.classList.add('visible');
+    chatHistory.classList.add('visible');
+    const wrap = document.createElement('div');
+    wrap.className = 'chat-msg ai';
+    wrap.innerHTML = `<div class="ai-turn"><div class="ai-card"><div class="ai-card-body error">${escHtml(text)}</div></div></div>`;
+    chatHistory.appendChild(wrap);
+    scrollToEnd();
   }
 
   // ── Provider / model buttons ───────────────────────────────────────────────
@@ -468,21 +717,32 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // ── Context fetching ───────────────────────────────────────────────────────
 
-  function getPageText(tab, cb) {
-    chrome.tabs.sendMessage(tab.id, { type: 'GET_PAGE_DATA' }, (res) => {
-      if (chrome.runtime.lastError || !res) {
-        showError('Cannot access this page (try a regular http/https page).');
-        return;
+  function getPageText(tab, cb, onErr) {
+    const fail = onErr || showError;
+    if (!tab || tab.id == null) { fail('Cannot access this page (try a regular http/https page).'); return; }
+
+    // Inject on-demand so it works on tabs that were already open before the
+    // extension loaded (declared content scripts only reach pages opened after).
+    chrome.scripting.executeScript(
+      {
+        target: { tabId: tab.id },
+        func: () => (document.body?.innerText || '').replace(/[\n\t]+/g, ' ').trim(),
+      },
+      (results) => {
+        if (chrome.runtime.lastError || !results || !results[0]) {
+          fail('Cannot access this page (try a regular http/https page).');
+          return;
+        }
+        cb(results[0].result || '');
       }
-      cb(res?.text || '');
-    });
+    );
   }
 
   // ── Main handler ───────────────────────────────────────────────────────────
 
-  async function handleQuery(tab, query) {
+  async function handleQuery(tab, query, turn) {
     const key = savedApiKeys[selectedProvider];
-    if (!key) { showError('No API key for this provider. Open Settings (⚙).'); return; }
+    if (!key) { turn.fail('No API key for this provider. Open Settings (⚙).'); return; }
 
     getPageText(tab, async (text) => {
       activeController = new AbortController();
@@ -508,38 +768,42 @@ document.addEventListener('DOMContentLoaded', () => {
         });
       } catch (err) {
         setStopMode(false);
-        if (err.name === 'AbortError') return;
-        showError('Could not reach backend: ' + err.message);
+        if (err.name === 'AbortError') { turn.discard(); return; }
+        turn.fail('Could not reach backend: ' + err.message);
         return;
       }
 
       if (!response.ok) {
-        try { const d = await response.json(); showError(d.detail || 'Backend error.'); }
-        catch { showError('Backend error ' + response.status); }
+        setStopMode(false);
+        try { const d = await response.json(); turn.fail(d.detail || 'Backend error.'); }
+        catch { turn.fail('Backend error ' + response.status); }
         return;
       }
 
-      let fullText = '', started = false;
+      let errored = false;
 
       await readSSEStream(response, {
-        onMeta: () => {},
-        onTool: (name) => { updateThinking(name); },
-        onText: (text) => {
-          if (!started) { started = true; startAnswer(); }
-          fullText += text;
-          currentStreamEl.innerHTML = renderMarkdown(fullText);
-          chatHistory.scrollTop = chatHistory.scrollHeight;
-        },
-        onError: (msg) => { if (!activeController?.signal.aborted) showError(msg); },
+        onMeta:       () => {},
+        onTool:       (tool) => turn.onTool(tool),
+        onToolResult: (res)  => turn.onToolResult(res),
+        onText:       (t)    => turn.onText(t),
+        onError:      (msg)  => { if (!activeController?.signal.aborted) { errored = true; turn.fail(msg); } },
       });
 
-      stopAnswerSpin();
+      const aborted = activeController?.signal.aborted;
       setStopMode(false);
-      if (fullText) {
-        chatMessages.push({ role: 'assistant', content: fullText });
+      if (errored) return;
+
+      if (aborted && !turn.hasAnswer()) { turn.discard(); return; }
+
+      const rec = turn.finish();
+      if (rec.content.trim() || rec.steps.length) {
+        chatMessages.push({ role: 'assistant', ...rec });
         saveChat();
+      } else {
+        turn.discard();
       }
-    });
+    }, (m) => { setStopMode(false); turn.fail(m); });
   }
 
   // ── Input handling ─────────────────────────────────────────────────────────
@@ -560,7 +824,6 @@ document.addEventListener('DOMContentLoaded', () => {
     if (askBtn.classList.contains('stop-mode')) {
       activeController?.abort();
       setStopMode(false);
-      document.getElementById('chatTyping')?.remove();
       return;
     }
 
@@ -578,6 +841,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
       responseArea.classList.add('visible');
       chatHistory.classList.add('visible');
+      setChatting(true);   // first message → window grows, input docks to the bottom
       const userWrap = document.createElement('div');
       userWrap.className = 'chat-msg user';
       userWrap.innerHTML = `<div class="chat-bubble user-bubble">${escHtml(query)}</div><div class="chat-avatar user-av">${USER_AVATAR_SVG}</div>`;
@@ -586,8 +850,8 @@ document.addEventListener('DOMContentLoaded', () => {
       chatMessages.push({ role: 'user', content: query });
       saveChat(tab.url);
 
-      showThinking();
-      handleQuery(tab, query);
+      const turn = createAiTurn(selectedProvider, selectedModel?.label);
+      handleQuery(tab, query, turn);
     } catch (err) {
       showError('Unexpected error: ' + err.message);
     }

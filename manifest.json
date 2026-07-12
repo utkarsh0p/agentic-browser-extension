@@ -13,11 +13,14 @@
 
   "permissions": [
     "activeTab",
+    "scripting",
     "storage"
   ],
 
   "host_permissions": [
-    "https://api.cember.in/*"
+    "https://api.cember.in/*",
+    "http://localhost/*",
+    "http://127.0.0.1/*"
   ],
 
   "action": {

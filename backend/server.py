@@ -209,29 +209,67 @@ async def chat(
     messages.append(HumanMessage(content=body.query))
 
     # ── Stream the agent response ─────────────────────────────────────────────
+    # Two stream modes at once (no checkpointer needed — streaming ≠ persistence):
+    #   • "messages" → token-by-token text deltas (keeps the answer streaming live)
+    #   • "updates"  → complete messages at each node boundary, so tool calls arrive
+    #                  with full args and tool results (ToolMessages) can be forwarded.
+    # The frontend classifies text into "reasoning" vs "answer" by event ordering:
+    # a step whose text is followed by a tool call is reasoning; the final tool-less
+    # text is the answer.
     async def generate():
         yield f"data: {json.dumps({'status': 'started'})}\n\n"
+        seen_tool_ids = set()
+
+        def _flatten(content):
+            if isinstance(content, list):
+                return "".join(
+                    block.get("text", "") if isinstance(block, dict) else str(block)
+                    for block in content
+                )
+            return content if isinstance(content, str) else ""
+
         try:
             async with asyncio.timeout(LLM_TIMEOUT):
-                async for chunk in agent.astream(
-                    {"messages": messages}, stream_mode="messages"
+                async for mode, data in agent.astream(
+                    {"messages": messages}, stream_mode=["messages", "updates"]
                 ):
-                    msg, metadata = chunk
-                    if hasattr(msg, "tool_calls") and msg.tool_calls:
-                        for tc in msg.tool_calls:
-                            yield f"data: {json.dumps({'tool': tc['name']})}\n\n"
-                    if metadata.get("langgraph_node") == "tools":
+                    # ── token deltas: stream text from the model node only ──────
+                    if mode == "messages":
+                        msg, metadata = data
+                        if metadata.get("langgraph_node") == "tools":
+                            continue
+                        text = _flatten(getattr(msg, "content", None))
+                        if text:
+                            yield f"data: {json.dumps({'text': text})}\n\n"
                         continue
-                    if not hasattr(msg, "content"):
-                        continue
-                    content = msg.content
-                    if isinstance(content, list):
-                        content = "".join(
-                            block.get("text", "") if isinstance(block, dict) else str(block)
-                            for block in content
-                        )
-                    if isinstance(content, str) and content:
-                        yield f"data: {json.dumps({'text': content})}\n\n"
+
+                    # ── node boundaries: tool calls (with args) + tool results ──
+                    for node, upd in data.items():
+                        node_msgs = upd.get("messages", []) if isinstance(upd, dict) else []
+                        for m in node_msgs:
+                            if node == "tools" or getattr(m, "type", None) == "tool":
+                                summary = _flatten(getattr(m, "content", "")) or str(getattr(m, "content", ""))
+                                yield "data: " + json.dumps({"tool_result": {
+                                    "id": getattr(m, "tool_call_id", None),
+                                    "name": getattr(m, "name", ""),
+                                    "summary": summary[:300],
+                                }}) + "\n\n"
+                                continue
+                            for tc in (getattr(m, "tool_calls", None) or []):
+                                tc_id = tc.get("id")
+                                if tc_id in seen_tool_ids:
+                                    continue
+                                seen_tool_ids.add(tc_id)
+                                try:
+                                    args = tc.get("args", {})
+                                    json.dumps(args)
+                                except (TypeError, ValueError):
+                                    args = {}
+                                yield "data: " + json.dumps({"tool": {
+                                    "name": tc.get("name"),
+                                    "args": args,
+                                    "id": tc_id,
+                                }}) + "\n\n"
         except TimeoutError:
             yield f"data: {json.dumps({'error': f'LLM timed out after {LLM_TIMEOUT}s.'})}\n\n"
         except Exception as e:
