@@ -12,11 +12,6 @@ const AI_AVATAR_SVG = `<svg viewBox="0 0 100 100" width="14" height="14" fill="n
   <line x1="57" y1="50" x2="79" y2="73" stroke="#fafaf8" stroke-width="9" stroke-linecap="round"/>
 </svg>`;
 
-const USER_AVATAR_SVG = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
-  <circle cx="12" cy="8" r="4"/>
-  <path d="M4 20c0-4 3.6-7 8-7s8 3 8 7"/>
-</svg>`;
-
 const TYPING_SVG = `<svg class="dots-anim" width="28" height="12" viewBox="0 0 28 12" xmlns="http://www.w3.org/2000/svg">
   <circle cx="5"  cy="6" r="2.2" fill="#aaaaaa"><animate id="td0" begin="0;td2.end+0.25s" attributeName="cy" calcMode="spline" dur="0.55s" values="6;2.5;6" keySplines=".33,.66,.66,1;.33,0,.66,.33"/></circle>
   <circle cx="14" cy="6" r="2.2" fill="#aaaaaa"><animate begin="td0.begin+0.1s" attributeName="cy" calcMode="spline" dur="0.55s" values="6;2.5;6" keySplines=".33,.66,.66,1;.33,0,.66,.33"/></circle>
@@ -99,18 +94,17 @@ function formatTime(ts) {
 // Whisper-voice labels for the reasoning rail
 const TOOL_DISPLAY = {
   search_page:                        'Searching the page',
-  summarize_page:                     'Reading the page',
+  summarize_page:                     'Summarizing the page',
   web_search:                         'Searching the web',
   COMPOSIO_SEARCH_TOOLS:              'Finding tools',
   COMPOSIO_CHECK_ACTIVE_CONNECTIONS:  'Checking connections',
   COMPOSIO_INITIATE_CONNECTION:       'Connecting',
-  COMPOSIO_EXECUTE_ACTION:            'Taking action',
   COMPOSIO_MANAGE_CONNECTIONS:        'Managing connections',
-  COMPOSIO_MULTI_EXECUTE_TOOL:        'Running tools',
+  // EXECUTE_ACTION / MULTI_EXECUTE_TOOL are deliberately absent: they fall
+  // through to railLabel's slug branch so the row names the real action.
 };
 
-function toolLabel(name) {
-  if (TOOL_DISPLAY[name]) return TOOL_DISPLAY[name];
+function prettify(name) {
   return (name || 'Working')
     .replace(/^COMPOSIO_/, '')
     .replace(/_/g, ' ')
@@ -118,25 +112,75 @@ function toolLabel(name) {
     .replace(/^./, c => c.toUpperCase());
 }
 
-// Pull a human-readable input (usually the query) from a tool's args
-function argPreview(args) {
-  if (!args || typeof args !== 'object') return '';
-  const v = args.query ?? args.q ?? args.input ?? args.text
-    ?? Object.values(args).find(x => typeof x === 'string');
-  if (typeof v !== 'string' || !v.trim()) return '';
-  return v.length > 64 ? v.slice(0, 64) + '…' : v;
+function toolLabel(name) {
+  return TOOL_DISPLAY[name] || prettify(name);
 }
 
-// Tool outputs are often raw JSON — never dump that into the trace.
-function cleanResult(s) {
-  s = (s || '').replace(/\s+/g, ' ').trim();
-  if (!s) return '';
-  if (/^[[{]/.test(s)) return '';                             // JSON blob
-  if (((s.match(/[{}[\]"]/g) || []).length) > 4) return '';   // looks structured
-  return s.length > 80 ? s.slice(0, 80) + '…' : s;
+// Composio's tools are meta-tools: the real action (GMAIL_SEND_EMAIL) is a
+// parameter, not the tool name. Read it from a fixed key list — never by
+// scanning args for "any string", which is what used to surface junk like
+// "wish" or "star" from whatever internal field happened to come first.
+const SLUG_KEYS = ['tool_slug', 'slug', 'action', 'tool_name', 'toolkit_slug', 'tool'];
+
+// Only slug-shaped values are accepted, so a wrong key can never render a nonce.
+const SLUG_SHAPE = /^[A-Z][A-Z0-9_]{3,}$/;
+
+function slugFromArgs(args) {
+  if (!args || typeof args !== 'object') return '';
+  const pick = (obj) => {
+    if (!obj || typeof obj !== 'object') return '';
+    for (const k of SLUG_KEYS) {
+      const v = obj[k];
+      if (typeof v === 'string' && SLUG_SHAPE.test(v.trim())) return v.trim();
+    }
+    return '';
+  };
+  const direct = pick(args);
+  if (direct) return direct;
+  // Multi-execute nests them: { tools: [{ tool_slug: 'GMAIL_SEND_EMAIL', … }] }
+  for (const v of Object.values(args)) {
+    if (Array.isArray(v)) {
+      for (const entry of v) {
+        const nested = pick(entry);
+        if (nested) return nested;
+      }
+    }
+  }
+  return '';
+}
+
+// A rail row's text comes from the tool's NAME, never from free-form arg text.
+function railLabel(name, args) {
+  if (TOOL_DISPLAY[name]) return TOOL_DISPLAY[name];
+  if (/^COMPOSIO_/.test(name || '')) {
+    return `${prettify(slugFromArgs(args) || name)} · executing`;
+  }
+  return prettify(name);
 }
 
 const PROVIDER_ORDER = ['claude', 'gemini', 'openai'];
+
+// ── Key metadata ──────────────────────────────────────────────────────────────
+// Provider keys live in storage under `apiKeys`, tool keys under `toolKeys`.
+// Carried over from the options page this panel replaced.
+
+const TOOL_ORDER = ['tavily', 'composio'];
+
+const TOOLS = {
+  tavily:   { label: 'Tavily',   sub: 'Web Search',       glyph: 'T' },
+  composio: { label: 'Composio', sub: 'App Integrations', glyph: 'C' },
+};
+
+const KEY_HINTS = {
+  claude:   { placeholder: 'sk-ant-api03-…', host: 'console.anthropic.com',  url: 'https://console.anthropic.com/',       prefix: 'sk-ant-' },
+  gemini:   { placeholder: 'AIzaSy…',        host: 'aistudio.google.com',    url: 'https://aistudio.google.com/apikey',   prefix: 'AIza'    },
+  openai:   { placeholder: 'sk-proj-…',      host: 'platform.openai.com',    url: 'https://platform.openai.com/api-keys', prefix: 'sk-'     },
+  tavily:   { placeholder: 'tvly-…',         host: 'app.tavily.com',         url: 'https://app.tavily.com/home',          prefix: 'tvly-'   },
+  composio: { placeholder: 'ak_…',           host: 'app.composio.dev',       url: 'https://app.composio.dev/',            prefix: 'ak_'     },
+};
+
+const EYE_OPEN_ICON = `<svg class="eye-open" width="14" height="14" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg>`;
+const EYE_SHUT_ICON = `<svg class="eye-closed" style="display:none" width="14" height="14" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21"/></svg>`;
 
 const MODELS = {
   openai: [
@@ -195,6 +239,9 @@ document.addEventListener('DOMContentLoaded', () => {
   const input        = document.getElementById('query');
   const settingsBtn  = document.getElementById('settingsBtn');
   const responseArea = document.getElementById('responseArea');
+  const shell        = document.querySelector('.popup-shell');
+  const setupBtn     = document.getElementById('setupBtn');
+  const newChatBtn   = document.getElementById('newChatBtn');
 
   // Active-page indicator in the header
   const pageIndicator = document.getElementById('pageIndicator');
@@ -205,6 +252,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const overlay      = document.getElementById('overlay');
   const overlayTitle = document.getElementById('overlayTitle');
   const overlayList  = document.getElementById('overlayList');
+  const overlayFooter = document.getElementById('overlayFooter');
   const overlayClose = document.getElementById('overlayClose');
   const overlayBack  = document.getElementById('overlayBack');
 
@@ -245,7 +293,18 @@ document.addEventListener('DOMContentLoaded', () => {
     const streaming = !!activeView()?.streaming;
     askBtn.innerHTML = streaming ? STOP_ICON : SEND_ICON;
     askBtn.classList.toggle('stop-mode', streaming);
-    askBtn.disabled  = streaming ? false : !input.value.trim();
+    askBtn.disabled  = streaming ? false : (input.disabled || !input.value.trim());
+  }
+
+  // ── First-run gate ──────────────────────────────────────────────────────────
+  // Without at least one LLM key there is nothing the panel can do, so it shows
+  // the setup prompt instead of a chat the user cannot use.
+  function updateSetupGate() {
+    const ready = PROVIDER_ORDER.some(p => savedApiKeys[p]);
+    shell.classList.toggle('needs-keys', !ready);
+    input.disabled = !ready;
+    input.placeholder = ready ? 'Ask anything about this page…' : 'Add an API key to start';
+    refreshSendButton();
   }
 
   function setStreaming(view, on) {
@@ -283,6 +342,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // was a no-op; catch it up now that the element has a layout box.
     scrollToEnd(view.el);
     refreshSendButton();
+    refreshNewChatBtn();
   }
 
   // Strip the fragment: in-page #anchor navigation must not wipe a conversation.
@@ -340,7 +400,10 @@ document.addEventListener('DOMContentLoaded', () => {
     view.el.replaceChildren();
     delete storedChats[view.tabId];
     chrome.storage.local.set({ chats: storedChats });
-    if (isActive(view)) responseArea.classList.remove('visible');
+    if (isActive(view)) {
+      responseArea.classList.remove('visible');
+      refreshNewChatBtn();
+    }
   }
 
   // ── Chat persistence ────────────────────────────────────────────────────
@@ -356,7 +419,7 @@ document.addEventListener('DOMContentLoaded', () => {
       if (msg.role === 'user') {
         const wrap = document.createElement('div');
         wrap.className = 'chat-msg user';
-        wrap.innerHTML = `<div class="chat-bubble user-bubble">${escHtml(msg.content)}</div><div class="chat-avatar user-av">${USER_AVATAR_SVG}</div>`;
+        wrap.innerHTML = `<div class="chat-bubble user-bubble">${escHtml(msg.content)}</div>`;
         view.el.appendChild(wrap);
       } else {
         view.el.appendChild(renderStoredAiTurn(msg));
@@ -381,7 +444,8 @@ document.addEventListener('DOMContentLoaded', () => {
       let toolCount = 0;
       for (const s of steps) {
         if (s.kind === 'tool') {
-          rail.appendChild(railToolEl(s.name, s.argPreview, { done: true, summary: s.summary || '' }));
+          // s.label is absent on chats stored before the rail rewrite
+          rail.appendChild(railToolEl(s.label || toolLabel(s.name), { done: true, count: s.count || 1 }));
           toolCount++;
         } else if (s.kind === 'reason' && s.text) {
           rail.appendChild(railReasonEl(s.text));
@@ -402,6 +466,11 @@ document.addEventListener('DOMContentLoaded', () => {
   function clearActiveChat() {
     const view = activeView();
     if (view) resetView(view, view.url);
+  }
+
+  // Nothing to start over from on an empty chat — say so rather than no-op
+  function refreshNewChatBtn() {
+    newChatBtn.disabled = !activeView()?.el.childElementCount;
   }
 
   // ── Load saved state ───────────────────────────────────────────────────────
@@ -513,6 +582,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   (async () => {
     await loadSettings();
+    updateSetupGate();
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (tab?.windowId != null) panelWindowId = tab.windowId;
     await loadChats(tab);
@@ -586,16 +656,23 @@ document.addEventListener('DOMContentLoaded', () => {
     return el;
   }
 
-  function railToolEl(name, argp, { done = false } = {}) {
+  function railToolEl(label, { done = false, count = 1 } = {}) {
     const el = document.createElement('div');
     el.className = 'rail-step tool' + (done ? ' done' : ' active');
     el.innerHTML =
       `<span class="rail-dot">${done ? TICK_ICON : ''}</span>` +
       `<span class="rail-body">` +
-        `<span class="rail-tool-label">${escHtml(toolLabel(name))}</span>` +
-        (argp ? `<span class="rail-arg">${escHtml(argp)}</span>` : '') +
+        `<span class="rail-tool-label">${escHtml(label)}</span>` +
+        `<span class="rail-count"></span>` +
       `</span>`;
+    setRailCount(el, count);
     return el;
+  }
+
+  // A retried call collapses into its own row rather than repeating it
+  function setRailCount(el, count) {
+    const badge = el.querySelector('.rail-count');
+    if (badge) badge.textContent = count > 1 ? `×${count}` : '';
   }
 
   // Collapse a finished rail into a "Whispered through N steps · Ns" chip
@@ -628,7 +705,7 @@ document.addEventListener('DOMContentLoaded', () => {
     rail.className = 'whisper-rail';
     const waiting = document.createElement('div');
     waiting.className = 'rail-step reason active waiting';
-    waiting.innerHTML = `<span class="rail-dot"></span><span class="rail-body"><span class="whispering-label">Whispering</span>${TYPING_SVG}</span>`;
+    waiting.innerHTML = `<span class="rail-dot"></span><span class="rail-body"><span class="whispering-label">Whispering</span>${TYPING_SVG}<span class="rail-elapsed"></span></span>`;
     rail.appendChild(waiting);
 
     const { card, body } = makeCard(provider, model);
@@ -642,10 +719,35 @@ document.addEventListener('DOMContentLoaded', () => {
     const startTs = Date.now();
     const steps   = [];         // persisted: {kind:'reason'|'tool', ...}
     const toolEls = {};         // tool id -> { el, item }
+    let lastToolEl = null;      // for collapsing consecutive identical calls
     let answer    = '';         // provisional final-answer markdown
     let toolCount = 0;
 
-    const dropWaiting = () => { waiting.remove(); };
+    // The waiting row is shown whenever the turn is live and nothing else is
+    // animating — notably BETWEEN steps, which is where the agent actually
+    // spends its time. It used to be destroyed on the first tool call.
+    let ticker = null;
+    const elapsedEl = waiting.querySelector('.rail-elapsed');
+
+    function paintElapsed() {
+      const secs = Math.round((Date.now() - startTs) / 1000);
+      elapsedEl.textContent = secs >= 1 ? `${secs}s` : '';
+    }
+    function startTicker() {
+      paintElapsed();
+      ticker ??= setInterval(paintElapsed, 1000);
+    }
+    // The panel outlives every turn, so a stray interval would run forever
+    function stopTicker() { if (ticker) { clearInterval(ticker); ticker = null; } }
+
+    const showWaiting = () => {
+      waiting.remove();          // re-append so it stays the LAST row
+      rail.appendChild(waiting);
+      startTicker();
+    };
+    const hideWaiting = () => { waiting.remove(); stopTicker(); };
+
+    startTicker();
     // Any text collected in the answer body before a tool call was actually reasoning
     function flushAnswerAsReason() {
       const t = answer.trim();
@@ -660,42 +762,57 @@ document.addEventListener('DOMContentLoaded', () => {
 
     return {
       onText(delta) {
-        dropWaiting();
+        hideWaiting();
         answer += delta;
         card.style.display = '';
         body.innerHTML = renderMarkdown(answer);
         scrollToEnd(view.el);
       },
       onTool(tool) {
-        dropWaiting();
+        hideWaiting();
         flushAnswerAsReason();
         // Accept both the new object form {name,args,id} and the legacy string form
         const isObj = tool && typeof tool === 'object';
         const name  = isObj ? tool.name : tool;
-        const argp  = argPreview(isObj ? tool.args : null);
-        const item  = { kind: 'tool', name, argPreview: argp, summary: '' };
+        const args  = isObj ? tool.args : null;
+        const label = railLabel(name, args);
+        // Temporary: reveals Composio's real arg keys so SLUG_KEYS can be tightened
+        console.debug('[SiteWhisper] tool', name, Object.keys(args || {}));
+
+        const last = steps[steps.length - 1];
+        if (last && last.kind === 'tool' && last.label === label && lastToolEl) {
+          last.count = (last.count || 1) + 1;
+          setRailCount(lastToolEl, last.count);
+          lastToolEl.classList.remove('done');
+          lastToolEl.classList.add('active');
+          lastToolEl.querySelector('.rail-dot').innerHTML = '';
+          if (isObj && tool.id != null) toolEls[tool.id] = { el: lastToolEl, item: last };
+          scrollToEnd(view.el);
+          return;
+        }
+
+        const item = { kind: 'tool', name, label, count: 1 };
         steps.push(item);
-        const el = railToolEl(name, argp);
+        const el = railToolEl(label);
         rail.appendChild(el);
+        lastToolEl = el;
         if (isObj && tool.id != null) toolEls[tool.id] = { el, item };
         toolCount++;
         scrollToEnd(view.el);
       },
       onToolResult(res) {
         const ref = res && res.id != null ? toolEls[res.id] : null;
-        const short = cleanResult(res && res.summary);
         if (ref) {
-          ref.item.summary = short;
           ref.el.classList.remove('active');
           ref.el.classList.add('done');
           ref.el.querySelector('.rail-dot').innerHTML = TICK_ICON;
-          if (short) ref.el.querySelector('.rail-result').textContent = short;
         }
+        showWaiting();   // nothing animates between steps otherwise
         scrollToEnd(view.el);
       },
       // Finalize: fold the rail, stamp footer, return the record to persist
       finish() {
-        dropWaiting();
+        hideWaiting();
         // Resolve any tool still shown as running (e.g. a backend that never sent tool_result)
         rail.querySelectorAll('.rail-step.tool.active').forEach(el => {
           el.classList.remove('active');
@@ -716,14 +833,14 @@ document.addEventListener('DOMContentLoaded', () => {
         return { content: answer, provider, model, ts, durationMs, steps };
       },
       fail(text) {
-        dropWaiting();
+        hideWaiting();
         rail.remove();
         card.style.display = '';
         body.className = 'ai-card-body error';
         body.textContent = text;
         scrollToEnd(view.el);
       },
-      discard() { wrap.remove(); },
+      discard() { stopTicker(); wrap.remove(); },
       hasAnswer() { return !!answer.trim(); },
       hasSteps()  { return steps.length > 0; },
     };
@@ -738,6 +855,7 @@ document.addEventListener('DOMContentLoaded', () => {
     wrap.innerHTML = `<div class="ai-turn"><div class="ai-card"><div class="ai-card-body error">${escHtml(text)}</div></div></div>`;
     view.el.appendChild(wrap);
     scrollToEnd(view.el);
+    if (isActive(view)) refreshNewChatBtn();
   }
 
   // ── Provider / model buttons ───────────────────────────────────────────────
@@ -758,10 +876,146 @@ document.addEventListener('DOMContentLoaded', () => {
     el.classList.add('switching');
   }
 
+  // ── Keys screen ────────────────────────────────────────────────────────────
+  // Replaces the old options page. Saved keys are never rendered back into the
+  // inputs — a "Saved" badge stands in, so a stored secret can't be read off
+  // the screen. Saving merges, so a key the user didn't retype survives.
+
+  const KEY_GROUPS = [
+    { title: 'Provider Keys', ids: PROVIDER_ORDER, scope: 'api',
+      meta: id => PROVIDERS[id],
+      iconHTML: id => PROVIDERS[id].icon,
+      saved: id => !!savedApiKeys[id] },
+    { title: 'Tool Keys', ids: TOOL_ORDER, scope: 'tool',
+      meta: id => TOOLS[id],
+      iconHTML: id => `<span class="key-glyph">${TOOLS[id].glyph}</span>`,
+      saved: id => !!savedToolKeys[id] },
+  ];
+
+  // One accordion row: the name is all you see until it's tapped open.
+  function keyRowEl(group, id) {
+    const meta = group.meta(id);
+    const hint = KEY_HINTS[id];
+    const row  = document.createElement('div');
+    row.className = 'key-acc';
+    row.innerHTML = `
+      <button class="key-acc-head" type="button">
+        <span class="key-row-left">
+          <span class="key-row-icon">${group.iconHTML(id)}</span>
+          <span class="key-row-meta">
+            <span class="key-row-name">${escHtml(meta.label)}</span>
+            <span class="key-row-sub">${escHtml(meta.sub)}</span>
+          </span>
+        </span>
+        <span class="key-acc-right">
+          <span class="saved-badge${group.saved(id) ? ' visible' : ''}" data-badge="${id}">${TICK_ICON}Saved</span>
+          <svg class="key-acc-chev" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M6 9l6 6 6-6"/></svg>
+        </span>
+      </button>
+      <div class="key-acc-body">
+        <div class="input-wrap">
+          <input type="password" class="key-input" data-key="${id}"
+                 placeholder="${escHtml(hint.placeholder)}" autocomplete="off" spellcheck="false" />
+          <button class="eye-btn" type="button">${EYE_OPEN_ICON}${EYE_SHUT_ICON}</button>
+        </div>
+        <p class="hint">Get at <a href="${hint.url}" target="_blank" rel="noopener">${escHtml(hint.host)}</a> — starts with <code>${escHtml(hint.prefix)}</code></p>
+      </div>`;
+
+    const field = row.querySelector('.key-input');
+
+    // Accordion: opening one closes the rest. A collapsed row keeps whatever was
+    // typed into it, so Save still picks up every key entered this visit.
+    row.querySelector('.key-acc-head').addEventListener('click', () => {
+      const wasOpen = row.classList.contains('open');
+      overlayList.querySelectorAll('.key-acc').forEach(r => r.classList.remove('open'));
+      if (!wasOpen) { row.classList.add('open'); field.focus?.(); }
+    });
+
+    // Eye toggle — lets the user verify what they just pasted
+    row.querySelector('.eye-btn').addEventListener('click', (e) => {
+      const hidden = field.type === 'password';
+      field.type = hidden ? 'text' : 'password';
+      e.currentTarget.querySelector('.eye-open').style.display   = hidden ? 'none' : '';
+      e.currentTarget.querySelector('.eye-closed').style.display = hidden ? ''     : 'none';
+    });
+    return row;
+  }
+
+  function renderKeysScreen() {
+    for (const group of KEY_GROUPS) {
+      const wrap = document.createElement('div');
+      wrap.className = 'ov-group';
+      const title = document.createElement('div');
+      title.className = 'ov-group-title';
+      title.textContent = group.title;
+      wrap.appendChild(title);
+      group.ids.forEach(id => wrap.appendChild(keyRowEl(group, id)));
+      overlayList.appendChild(wrap);
+    }
+
+    const saveBtn = document.createElement('button');
+    saveBtn.type      = 'button';
+    saveBtn.className = 'save-btn';
+    saveBtn.textContent = 'Save Keys';
+    const status = document.createElement('div');
+    status.className = 'status-msg';
+    overlayFooter.append(saveBtn, status);
+
+    const setStatus = (msg, isError) => {
+      status.textContent = msg;
+      status.className   = 'status-msg ' + (isError ? 'error' : 'success');
+    };
+
+    saveBtn.addEventListener('click', async () => {
+      const collected = { api: {}, tool: {} };
+      for (const group of KEY_GROUPS) {
+        for (const id of group.ids) {
+          const val = overlayList.querySelector(`.key-input[data-key="${id}"]`)?.value.trim();
+          if (val) collected[group.scope][id] = val;
+        }
+      }
+      const added = [...Object.keys(collected.api), ...Object.keys(collected.tool)];
+      if (!added.length) { setStatus('Enter at least one key to save.', true); return; }
+
+      saveBtn.disabled    = true;
+      saveBtn.textContent = 'Saving…';
+      try {
+        // Merge over what's stored — never clobber a key that wasn't retyped
+        const cur = await chrome.storage.local.get(['apiKeys', 'toolKeys']);
+        await chrome.storage.local.set({
+          apiKeys:  { ...(cur.apiKeys  || {}), ...collected.api  },
+          toolKeys: { ...(cur.toolKeys || {}), ...collected.tool },
+        });
+      } catch (err) {
+        saveBtn.disabled    = false;
+        saveBtn.textContent = 'Save Keys';
+        setStatus('Could not save: ' + err.message, true);
+        return;
+      }
+
+      // Re-reads keys, auto-selects a provider and re-renders the selectors
+      await loadSettings();
+      updateSetupGate();
+
+      added.forEach(id => {
+        overlayList.querySelector(`.saved-badge[data-badge="${id}"]`)?.classList.add('visible');
+        const field = overlayList.querySelector(`.key-input[data-key="${id}"]`);
+        if (field) { field.value = ''; field.type = 'password'; }
+      });
+      // Fold everything back to the plain name list, now showing Saved badges
+      overlayList.querySelectorAll('.key-acc').forEach(r => r.classList.remove('open'));
+      saveBtn.disabled    = false;
+      saveBtn.textContent = 'Save Keys';
+      setStatus('Saved!', false);
+      setTimeout(hideOverlay, 700);
+    });
+  }
+
   // ── Overlay ────────────────────────────────────────────────────────────────
 
   function showOverlay(mode, prevMode = null) {
     overlayList.innerHTML = '';
+    overlayFooter.innerHTML = '';
     overlayBack.style.display = prevMode ? 'flex' : 'none';
     overlayBack.onclick = prevMode ? () => showOverlay(prevMode) : null;
 
@@ -771,15 +1025,10 @@ document.addEventListener('DOMContentLoaded', () => {
       const items = [
         {
           icon: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="5" width="20" height="14" rx="2"/><path d="M2 10h20"/></svg>`,
-          label: 'Providers', sub: 'Manage your API keys',
-          action: () => { hideOverlay(); chrome.runtime.openOptionsPage(); },
+          label: 'API Keys', sub: 'Providers and tools',
+          action: () => showOverlay('keys', 'menu'),
         },
-        {
-          icon: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2m3 0v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6"/></svg>`,
-          label: 'Clear Chat', sub: 'Start a new conversation',
-          action: () => { clearActiveChat(); hideOverlay(); },
-        },
-      ];
+      ];   // Clear Chat lives in the header now, not in here
 
       items.forEach(item => {
         const btn = document.createElement('button');
@@ -800,6 +1049,10 @@ document.addEventListener('DOMContentLoaded', () => {
         if (!item.disabled) btn.addEventListener('click', item.action);
         overlayList.appendChild(btn);
       });
+
+    } else if (mode === 'keys') {
+      overlayTitle.textContent = 'API Keys';
+      renderKeysScreen();
 
     } else if (mode === 'provider') {
       overlayTitle.textContent = 'Choose Provider';
@@ -829,10 +1082,11 @@ document.addEventListener('DOMContentLoaded', () => {
             animate(modelBtnInner);
             renderProviderBtn();
             renderModelBtn();
+            hideOverlay();
           } else {
-            chrome.runtime.openOptionsPage();
+            // No key for this provider — go add one, with a way back
+            showOverlay('keys', 'provider');
           }
-          hideOverlay();
         });
         overlayList.appendChild(btn);
       });
@@ -877,6 +1131,8 @@ document.addEventListener('DOMContentLoaded', () => {
   providerBtn.addEventListener('click', () => showOverlay('provider'));
   modelBtn.addEventListener('click',    () => showOverlay('model'));
   settingsBtn.addEventListener('click', () => showOverlay('menu'));
+  setupBtn.addEventListener('click',    () => showOverlay('keys'));
+  newChatBtn.addEventListener('click',  () => clearActiveChat());
 
   // ── Context fetching ───────────────────────────────────────────────────────
 
@@ -904,7 +1160,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   async function handleQuery(tab, view, query, turn) {
     const key = savedApiKeys[selectedProvider];
-    if (!key) { turn.fail('No API key for this provider. Open Settings (⚙).'); return; }
+    if (!key) { turn.fail('No API key for this provider. Open the ☰ menu → API Keys.'); return; }
 
     getPageText(tab, async (text) => {
       const controller = new AbortController();
@@ -991,7 +1247,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     const query = input.value.trim();
     if (!query) return;
-    if (!selectedProvider) { showError('No provider set. Open Settings (⚙) to add an API key.'); return; }
+    if (!selectedProvider) { showError('No provider set. Open the ☰ menu → API Keys to add one.'); return; }
 
     input.value        = '';
     input.style.height = 'auto';
@@ -1014,9 +1270,10 @@ document.addEventListener('DOMContentLoaded', () => {
       reveal(view);
       const userWrap = document.createElement('div');
       userWrap.className = 'chat-msg user';
-      userWrap.innerHTML = `<div class="chat-bubble user-bubble">${escHtml(query)}</div><div class="chat-avatar user-av">${USER_AVATAR_SVG}</div>`;
+      userWrap.innerHTML = `<div class="chat-bubble user-bubble">${escHtml(query)}</div>`;
       view.el.appendChild(userWrap);
       scrollToEnd(view.el);
+      refreshNewChatBtn();
       view.messages.push({ role: 'user', content: query });
       saveChat(view);
 

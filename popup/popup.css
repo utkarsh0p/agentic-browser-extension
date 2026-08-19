@@ -42,6 +42,59 @@ body {
   background: #fafaf8;
 }
 
+/* ── First-run gate ──────────────────────────────────────────────────────────
+   No LLM key yet: the setup prompt takes the space the chat normally fills. */
+.setup-prompt { display: none; }
+.popup-shell.needs-keys .response-area { display: none; }
+.popup-shell.needs-keys .setup-prompt {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+  align-items: center;
+  justify-content: center;
+  padding: 20px 22px;
+  overflow-y: auto;
+}
+
+.setup-inner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 8px;
+  max-width: 300px;
+}
+
+.setup-icon { width: 28px; height: 28px; color: #c8c8c0; margin-bottom: 2px; }
+
+.setup-title {
+  font-size: var(--fs-lg);
+  font-weight: 600;
+  color: #1a1a1a;
+}
+
+.setup-sub {
+  font-size: var(--fs-sm);
+  color: #9a9a92;
+  line-height: 1.55;
+}
+
+.setup-btn {
+  margin-top: 6px;
+  padding: 8px 18px;
+  border: none;
+  border-radius: 10px;
+  background: #111111;
+  color: #f5f5f0;
+  font-size: var(--fs-base);
+  font-weight: 600;
+  font-family: 'Inter', sans-serif;
+  cursor: pointer;
+  transition: background 0.15s, transform 0.1s;
+}
+.setup-btn:hover  { background: #2a2a2a; }
+.setup-btn:active { transform: scale(0.98); }
+
 /* ── Header ─────────────────────────────────────────────────────────────────── */
 
 .popup-header {
@@ -105,7 +158,14 @@ body {
   text-overflow: ellipsis;
 }
 
-.settings-btn {
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+.header-btn {
   display: flex;
   align-items: center;
   justify-content: center;
@@ -117,13 +177,19 @@ body {
   background: transparent;
   color: #999;
   cursor: pointer;
-  transition: background 0.15s, color 0.15s;
+  transition: background 0.15s, color 0.15s, opacity 0.15s;
 }
 
-.settings-btn:hover {
+.header-btn:hover:not(:disabled) {
   background: rgba(0, 0, 0, 0.06);
   color: #1a1a1a;
 }
+
+/* Dimmed rather than hidden, so the header doesn't reflow as chats start */
+.header-btn:disabled { opacity: 0.3; cursor: default; }
+
+/* No chat to start over from while the key gate is up */
+.popup-shell.needs-keys .new-chat-btn { display: none; }
 
 /* ── Input area ──────────────────────────────────────────────────────────────── */
 
@@ -159,6 +225,11 @@ body {
 
 .input-card textarea::placeholder {
   color: #b0b0a8;
+}
+
+.input-card textarea:disabled {
+  cursor: not-allowed;
+  color: #b8b8b0;
 }
 
 /* ── Toolbar ─────────────────────────────────────────────────────────────────── */
@@ -293,6 +364,188 @@ body {
 .overlay-list::-webkit-scrollbar { width: 3px; }
 .overlay-list::-webkit-scrollbar-thumb { background: #d4d4cc; border-radius: 4px; }
 
+/* Pinned under the scroller — holds the keys screen's Save button */
+.overlay-footer {
+  flex-shrink: 0;
+  padding: 0;
+}
+.overlay-footer:not(:empty) {
+  padding: 10px 14px 12px;
+  border-top: 1px solid #ececea;
+  background: #fafaf8;
+}
+
+/* ── Keys screen ─────────────────────────────────────────────────────────────
+   Styles ported from the old options page (options/option.css) and retuned for
+   panel width — same visual language, one column instead of two. */
+
+.ov-group-title {
+  font-size: var(--fs-2xs);
+  font-weight: 600;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: #b0b0a8;
+  padding: 0 14px 6px;
+}
+
+.ov-group { padding-top: 10px; }
+
+/* Clear breathing room between Provider Keys and Tool Keys */
+.ov-group + .ov-group {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid #f0f0ec;
+}
+
+/* ── Accordion rows: name only until tapped, then the input unfolds ────────── */
+
+.key-acc + .key-acc { border-top: 1px solid #f6f6f2; }
+
+.key-acc-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  padding: 10px 14px;
+  border: none;
+  background: none;
+  font-family: 'Inter', sans-serif;
+  text-align: left;
+  color: #1a1a1a;
+  cursor: pointer;
+  transition: background 0.1s;
+}
+.key-acc-head:hover { background: #f5f5f0; }
+.key-acc.open .key-acc-head { background: #f5f5f0; }
+
+.key-acc-right { display: flex; align-items: center; gap: 7px; flex-shrink: 0; }
+
+.key-acc-chev {
+  opacity: 0.4;
+  flex-shrink: 0;
+  transition: transform 0.15s;
+}
+.key-acc.open .key-acc-chev { transform: rotate(180deg); }
+
+.key-acc-body { display: none; padding: 8px 14px 12px; }
+.key-acc.open .key-acc-body { display: block; }
+
+.key-row-left { display: flex; align-items: center; gap: 9px; min-width: 0; }
+.key-row-meta { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.key-row-name { font-size: var(--fs-base); font-weight: 500; line-height: 1.2; }
+.key-row-sub  { font-size: var(--fs-xs); color: #aaaaaa; }
+.key-row-icon { display: flex; align-items: center; line-height: 1; width: 16px; flex-shrink: 0; }
+
+.saved-badge {
+  display: none;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  font-size: var(--fs-2xs);
+  font-weight: 500;
+  color: #22863a;
+  background: #eafbf0;
+  border: 1px solid #c3e6cb;
+  border-radius: 20px;
+  padding: 2px 8px 2px 5px;
+}
+.saved-badge.visible { display: flex; }
+.saved-badge svg { width: 9px; height: 9px; }
+
+/* Tool keys have no brand SVG — a letter badge stands in */
+.key-glyph {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 5px;
+  background: #f0f0ec;
+  color: #6a6a62;
+  font-size: var(--fs-2xs);
+  font-weight: 700;
+}
+
+.input-wrap { position: relative; }
+
+.key-input {
+  width: 100%;
+  padding: 8px 34px 8px 10px;
+  border-radius: 0;
+  border: 1px solid #ddddd8;
+  font-size: var(--fs-sm);
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  letter-spacing: 0.03em;
+  background: #f9f9f7;
+  color: #111111;
+  outline: none;
+  transition: border-color 0.15s, background 0.15s;
+}
+.key-input:focus { border-color: #111111; background: #ffffff; }
+.key-input::placeholder {
+  color: #b8b8b0;
+  font-family: 'Inter', sans-serif;
+  letter-spacing: 0;
+}
+
+.eye-btn {
+  position: absolute;
+  right: 7px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: #999992;
+  padding: 3px;
+  display: flex;
+  align-items: center;
+  line-height: 1;
+  border-radius: 4px;
+}
+.eye-btn:hover { color: #111111; }
+
+.hint {
+  font-size: var(--fs-2xs);
+  color: #999992;
+  line-height: 1.5;
+  margin-top: 5px;
+}
+.hint a { color: #444; text-decoration: underline; text-underline-offset: 2px; }
+.hint code {
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  background: #f0f0ec;
+  padding: 1px 4px;
+  border-radius: 4px;
+}
+
+.save-btn {
+  width: 100%;
+  padding: 10px;
+  border: none;
+  border-radius: 10px;
+  background: #111111;
+  color: #f5f5f0;
+  font-size: var(--fs-md);
+  font-weight: 600;
+  font-family: 'Inter', sans-serif;
+  cursor: pointer;
+  transition: background 0.15s, transform 0.1s;
+}
+.save-btn:hover  { background: #2a2a2a; }
+.save-btn:active { transform: scale(0.99); }
+.save-btn:disabled { background: #cccccc; cursor: not-allowed; transform: none; }
+
+.status-msg {
+  min-height: 15px;
+  text-align: center;
+  font-size: var(--fs-xs);
+  margin-top: 7px;
+}
+.status-msg.success { color: #22863a; }
+.status-msg.error   { color: #d32f2f; }
+
 .ov-option {
   display: flex;
   align-items: center;
@@ -409,17 +662,6 @@ body {
 .chat-msg.user { flex-direction: row-reverse; }
 .chat-msg.ai   { align-items: stretch; }
 
-.chat-avatar {
-  width: 22px;
-  height: 22px;
-  border-radius: 50%;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  flex-shrink: 0;
-}
-.user-av { background: #e8e8e4; color: #666660; }
-
 .chat-bubble {
   max-width: 82%;
   padding: 8px 11px;
@@ -445,18 +687,17 @@ body {
   --accent: #1a1a1a;
 }
 
+/* Answers read as plain text on the panel background — no card chrome */
 .ai-card {
-  background: #ffffff;
-  border: 1px solid #eceae4;
-  border-radius: 13px;
-  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.05);
-  overflow: hidden;
+  background: none;
+  border: none;
+  box-shadow: none;
 }
 .ai-card-header {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 8px 12px 0;
+  padding: 8px 0 0;
 }
 .ai-card-ic { display: flex; align-items: center; flex-shrink: 0; }
 .ai-card-ic svg { width: 12px; height: 12px; }
@@ -475,13 +716,13 @@ body {
 }
 
 .ai-card-body {
-  padding: 7px 12px 10px;
+  padding: 7px 0 10px;
   font-size: var(--fs-base);
   line-height: 1.6;
   color: #1a1a1a;
   word-break: break-word;
 }
-.ai-card-body.error { color: #b54a4a; font-size: var(--fs-sm); padding: 10px 12px; }
+.ai-card-body.error { color: #b54a4a; font-size: var(--fs-sm); padding: 10px 0; }
 .ai-empty { color: #a8a8a0; font-style: italic; }
 
 .ai-card-footer {
@@ -489,7 +730,7 @@ body {
   align-items: center;
   justify-content: flex-end;
   gap: 9px;
-  padding: 0 10px 8px;
+  padding: 0 0 8px;
 }
 .ai-time { font-size: var(--fs-2xs); color: #b6b6ae; }
 .copy-btn {
@@ -640,27 +881,29 @@ body {
   padding-bottom: 1px;
 }
 .rail-tool-label { font-size: var(--fs-sm); font-weight: 500; color: #4a4a45; }
-.rail-arg {
+/* ×N when a retried call collapses into one row */
+.rail-count {
   align-self: flex-start;
-  max-width: 100%;
-  font-size: var(--fs-xs);
+  font-size: var(--fs-2xs);
+  font-weight: 600;
   color: #9a9a92;
   background: #f0efe9;
   border-radius: 5px;
-  padding: 1px 6px;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  padding: 1px 5px;
   white-space: nowrap;
 }
-.rail-result {
-  max-width: 100%;
+.rail-count:empty { display: none; }
+
+/* Live elapsed seconds on the waiting row — quieter than the ×N pill.
+   Deliberately NOT disabled under prefers-reduced-motion: with the dots and
+   the dot pulse suppressed there, this is the only remaining liveness cue. */
+.rail-elapsed {
   font-size: var(--fs-2xs);
-  color: #b0b0a8;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  color: #9a9a92;
+  font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
-.rail-result:empty { display: none; }
+.rail-elapsed:empty { display: none; }
 .rail-reason {
   font-size: var(--fs-sm);
   font-style: italic;

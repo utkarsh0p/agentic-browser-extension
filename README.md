@@ -45,7 +45,7 @@ User types question
 **Frontend (Chrome Extension — Manifest V3)**
 - Plain JavaScript, HTML, CSS — no build step
 - `popup.js` — side panel UI: per-tab chats, provider/model selection, SSE streaming, persistence
-- `background.js` — routes the toolbar click to the side panel, opens options on first install, prunes chats for closed tabs
+- `background.js` — routes the toolbar click to the side panel, prunes chats for closed tabs
 - `content.js` — legacy `GET_PAGE_DATA` listener; page text is read via `chrome.scripting.executeScript` instead
 
 **Backend (FastAPI + LangGraph)**
@@ -95,18 +95,13 @@ The agent **decides** which tools to use — it's not a fixed pipeline. Simple q
 ```
 chrome-rag-extension/
 ├── manifest.json          # MV3 config — permissions, content scripts, side panel
-├── background.js          # Service worker — side panel behavior, options, chat cleanup
+├── background.js          # Service worker — side panel behavior, chat cleanup
 ├── content.js             # Injected into every page (legacy — see Tech Stack)
 │
 ├── popup/                 # The side panel document (path kept from the popup era)
 │   ├── popup.html         # Chat UI shell
 │   ├── popup.css          # Styles
-│   └── popup.js           # Per-tab chats, streaming, provider/model selection, persistence
-│
-├── options/
-│   ├── option.html        # API key + tool key setup (two-column layout)
-│   ├── option.css
-│   └── option.js          # Saves keys to chrome.storage.local
+│   └── popup.js           # Per-tab chats, streaming, provider/model selection, key setup
 │
 ├── icons/
 │   ├── logo.svg           # Source logo
@@ -141,7 +136,9 @@ docker compose up -d --build
 1. Open `chrome://extensions`
 2. Enable Developer mode
 3. Click **Load unpacked** → select the repo root
-4. Click the extension icon to toggle the side panel → open Settings (☰) → add your API key
+4. Click the extension icon to toggle the side panel. With no keys saved it opens
+   straight into the setup screen — add a key from Anthropic, Google, or OpenAI and
+   the chat unlocks. Later, reach it again via ☰ → **API Keys**.
 
 Requires Chrome/Edge/Brave 114+ for the Side Panel API.
 

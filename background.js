@@ -3,9 +3,8 @@
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true })
   .catch(console.error);
 
-chrome.runtime.onInstalled.addListener(() => {
-  chrome.runtime.openOptionsPage();
-});
+// Nothing opens on install — the panel gates itself and prompts for keys the
+// first time the user opens it (see updateSetupGate in popup/popup.js).
 
 // Chats are keyed by tab id, so a closed tab's conversation is dead weight.
 chrome.tabs.onRemoved.addListener(async (tabId) => {
