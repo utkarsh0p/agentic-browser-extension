@@ -34,7 +34,15 @@
           <circle cx="57" cy="50" r="5" fill="white"/>
           <circle cx="57" cy="50" r="3" fill="#1a1a1a"/>
         </svg>
-        <span class="brand-name">SiteWhisper</span>
+        <span class="brand-text">
+          <span class="brand-name">SiteWhisper</span>
+          <!-- Which page the next question will read — the panel outlives the
+               tab it was opened from, so this has to be explicit. -->
+          <span class="page-indicator" id="pageIndicator">
+            <img class="page-favicon" id="pageFavicon" alt="" />
+            <span class="page-host" id="pageHost"></span>
+          </span>
+        </span>
       </div>
       <button class="settings-btn" id="settingsBtn" title="Menu">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -46,10 +54,10 @@
       </button>
     </div>
 
-    <!-- ── Response area (grows to fill; pushes the input to the bottom) ── -->
-    <div class="response-area" id="responseArea">
-      <div class="chat-history" id="chatHistory"></div>
-    </div>
+    <!-- ── Response area (fills the panel; pushes the input to the bottom).
+         The .chat-history inside is created per tab by popup.js — see the
+         per-tab View model there. ── -->
+    <div class="response-area" id="responseArea"></div>
 
     <!-- ── Input card (docks to the bottom once chatting) ── -->
     <div class="input-area">

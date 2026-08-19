@@ -1,6 +1,6 @@
 # SiteWhisper
 
-A Chrome extension powered by a **LangGraph ReAct agent** that lives in your browser. It can read any webpage, search the web, and connect to 500+ apps — all from a chat popup.
+A Chrome extension powered by a **LangGraph ReAct agent** that lives in your browser. It can read any webpage, search the web, and connect to 500+ apps — all from a chat side panel that docks beside the page and stays open while you browse.
 
 ---
 
@@ -20,9 +20,9 @@ A Chrome extension powered by a **LangGraph ReAct agent** that lives in your bro
 User types question
         │
         ▼
-   popup.js (Chrome Extension UI)
+   popup.js (side panel UI — one chat per tab)
         │
-        ├── chrome.tabs.sendMessage → content.js
+        ├── chrome.scripting.executeScript → active tab
         │       └── Scrapes page text (raw innerText)
         │
         └── fetch POST /chat → FastAPI backend (https://api.cember.in)
@@ -44,9 +44,9 @@ User types question
 
 **Frontend (Chrome Extension — Manifest V3)**
 - Plain JavaScript, HTML, CSS — no build step
-- `content.js` — injected into every page, reads DOM text
-- `popup.js` — chat UI, provider/model selection, SSE streaming, chat persistence
-- `background.js` — opens options page on first install
+- `popup.js` — side panel UI: per-tab chats, provider/model selection, SSE streaming, persistence
+- `background.js` — routes the toolbar click to the side panel, opens options on first install, prunes chats for closed tabs
+- `content.js` — legacy `GET_PAGE_DATA` listener; page text is read via `chrome.scripting.executeScript` instead
 
 **Backend (FastAPI + LangGraph)**
 - FastAPI with SSE streaming responses
@@ -94,14 +94,14 @@ The agent **decides** which tools to use — it's not a fixed pipeline. Simple q
 
 ```
 chrome-rag-extension/
-├── manifest.json          # MV3 config — permissions, content scripts, popup
-├── background.js          # Service worker — opens options on first install
-├── content.js             # Injected into every page — scrapes page text
+├── manifest.json          # MV3 config — permissions, content scripts, side panel
+├── background.js          # Service worker — side panel behavior, options, chat cleanup
+├── content.js             # Injected into every page (legacy — see Tech Stack)
 │
-├── popup/
+├── popup/                 # The side panel document (path kept from the popup era)
 │   ├── popup.html         # Chat UI shell
 │   ├── popup.css          # Styles
-│   └── popup.js           # Chat logic, streaming, provider/model selection, persistence
+│   └── popup.js           # Per-tab chats, streaming, provider/model selection, persistence
 │
 ├── options/
 │   ├── option.html        # API key + tool key setup (two-column layout)
@@ -141,7 +141,9 @@ docker compose up -d --build
 1. Open `chrome://extensions`
 2. Enable Developer mode
 3. Click **Load unpacked** → select the repo root
-4. Click the extension icon → open Settings → add your API key
+4. Click the extension icon to toggle the side panel → open Settings (☰) → add your API key
+
+Requires Chrome/Edge/Brave 114+ for the Side Panel API.
 
 **Toggle backend URL** in `popup/popup.js`:
 ```javascript

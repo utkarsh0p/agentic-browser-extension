@@ -12,23 +12,28 @@
   },
 
   "permissions": [
-    "activeTab",
+    "sidePanel",
     "scripting",
-    "storage"
+    "storage",
+    "tabs"
   ],
 
   "host_permissions": [
+    "<all_urls>",
     "https://api.cember.in/*",
     "http://localhost/*",
     "http://127.0.0.1/*"
   ],
 
   "action": {
-    "default_popup": "popup/popup.html",
     "default_icon": {
       "16": "icons/icon16.png",
       "32": "icons/icon32.png"
     }
+  },
+
+  "side_panel": {
+    "default_path": "popup/popup.html"
   },
 
   "background": {

@@ -15,11 +15,10 @@
   --fs-brand:14px;    /* brand name */
 }
 
-html { overflow: hidden; }
+html, body { height: 100%; overflow: hidden; }
 
 body {
-  width: 480px;
-  overflow: hidden;
+  width: 100%;
   font-family: 'Inter', system-ui, -apple-system, sans-serif;
   font-size: var(--fs-base);
   background: #fafaf8;
@@ -27,17 +26,18 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
+/* Side panel: the shell fills its host, so height is never set from JS */
 .popup-shell {
   display: flex;
   flex-direction: column;
   position: relative;
   overflow: hidden;
-  transition: height 0.32s cubic-bezier(.4, 0, .2, 1);
+  height: 100%;
 }
 
-/* Conversing: fixed-height window, chat fills, input docked at the bottom */
-.popup-shell.chatting .response-area { flex: 1 1 auto; min-height: 0; }
-.popup-shell.chatting .input-area {
+/* Chat fills the panel; the input stays docked at the bottom, empty or not */
+.response-area { flex: 1 1 auto; min-height: 0; }
+.input-area {
   border-top: 1px solid #ececea;
   background: #fafaf8;
 }
@@ -55,6 +55,7 @@ body {
   display: flex;
   align-items: center;
   gap: 8px;
+  min-width: 0;   /* lets a long hostname ellipsize instead of pushing the menu out */
 }
 
 .brand-icon {
@@ -63,11 +64,45 @@ body {
   flex-shrink: 0;
 }
 
+.brand-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
 .brand-name {
   font-size: var(--fs-brand);
   font-weight: 700;
   letter-spacing: -0.3px;
   color: #1a1a1a;
+  line-height: 1.15;
+}
+
+/* ── Active-page indicator ───────────────────────────────────────────────────── */
+
+.page-indicator {
+  display: none;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+.page-indicator.visible { display: flex; }
+
+.page-favicon {
+  width: 11px;
+  height: 11px;
+  border-radius: 2px;
+  flex-shrink: 0;
+}
+.page-favicon:not([src]) { display: none; }
+
+.page-host {
+  font-size: var(--fs-2xs);
+  color: #a8a8a0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .settings-btn {
@@ -76,6 +111,7 @@ body {
   justify-content: center;
   width: 26px;
   height: 26px;
+  flex-shrink: 0;
   border: none;
   border-radius: 8px;
   background: transparent;
@@ -324,14 +360,19 @@ body {
 /* ── Response area ───────────────────────────────────────────────────────────── */
 
 .response-area {
-  display: none;
+  display: flex;
   flex-direction: column;
   padding: 0 12px 10px;
   border-top: 1px solid #ececea;
   margin-top: 2px;
+  /* Fades in on the first message — replaces the popup's old height animation.
+     opacity also hides the border-top, so the empty state stays clean. */
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.22s ease;
 }
 
-.response-area.visible { display: flex; }
+.response-area.visible { opacity: 1; pointer-events: auto; }
 
 /* Whispering label (waiting state on the reasoning rail) */
 .whispering-label {
@@ -634,7 +675,7 @@ body {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .popup-shell { transition: none; }
+  .response-area { transition: none; }
   .rail-step.active .rail-dot { animation: none; }
   .chip-chev { transition: none; }
   .dots-anim { display: none; }

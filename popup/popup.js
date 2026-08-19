@@ -1,6 +1,6 @@
 // ── Backend URL — toggle one line to switch between local and production ──────
-const BACKEND = 'http://localhost:5000';        // ← local testing
-// const BACKEND = 'https://api.cember.in';          // ← production
+//const BACKEND = 'http://localhost:5000';        // ← local testing
+const BACKEND = 'https://api.cember.in';          // ← production
 
 // ── Avatars ───────────────────────────────────────────────────────────────────
 
@@ -195,8 +195,11 @@ document.addEventListener('DOMContentLoaded', () => {
   const input        = document.getElementById('query');
   const settingsBtn  = document.getElementById('settingsBtn');
   const responseArea = document.getElementById('responseArea');
-  const chatHistory  = document.getElementById('chatHistory');
-  const shell        = document.querySelector('.popup-shell');
+
+  // Active-page indicator in the header
+  const pageIndicator = document.getElementById('pageIndicator');
+  const pageFavicon   = document.getElementById('pageFavicon');
+  const pageHost      = document.getElementById('pageHost');
 
   // Overlay elements
   const overlay      = document.getElementById('overlay');
@@ -220,60 +223,146 @@ document.addEventListener('DOMContentLoaded', () => {
   let selectedModel     = null;
   let savedApiKeys      = {};
   let savedToolKeys     = {};
-  let chatMessages      = [];
-  let activeController  = null;
+
+  // ── Per-tab conversations ───────────────────────────────────────────────────
+  // The panel outlives every tab it shows, so each tab owns a View whose `el` is
+  // a DETACHED .chat-history element. Switching tabs swaps which element is
+  // attached to #responseArea; a stream in flight keeps appending to its own
+  // detached node, so switching away mid-answer and back resumes it intact —
+  // no partial-state serialization, no aborted requests.
+  const views     = new Map();   // tabId -> { el, messages, url, controller, streaming, seq }
+  const MAX_VIEWS = 15;          // bound the DOM we keep alive; LRU beyond this
+  let storedChats  = {};         // in-memory mirror of chrome.storage.local.chats
+  let activeTabId  = null;
+  let seqCounter   = 0;
 
   const STOP_ICON = `<svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>`;
   const SEND_ICON = `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M12 5l7 7-7 7"/></svg>`;
 
-  function setStopMode(on) {
-    askBtn.disabled = false;
-    askBtn.innerHTML = on ? STOP_ICON : SEND_ICON;
-    askBtn.classList.toggle('stop-mode', on);
-    if (!on) askBtn.disabled = !input.value.trim();
+  // Send button reflects the ACTIVE view only — a background tab's stream must
+  // not put the visible button into stop mode.
+  function refreshSendButton() {
+    const streaming = !!activeView()?.streaming;
+    askBtn.innerHTML = streaming ? STOP_ICON : SEND_ICON;
+    askBtn.classList.toggle('stop-mode', streaming);
+    askBtn.disabled  = streaming ? false : !input.value.trim();
   }
 
-  // ── Window grow + input-dock transition ───────────────────────────────────
-  const ACTIVE_H = 500;   // conversing window height (px) — tune to taste
+  function setStreaming(view, on) {
+    view.streaming = on;
+    if (!on) view.controller = null;
+    refreshSendButton();
+  }
 
-  function setChatting(animate) {
-    if (shell.classList.contains('chatting')) return;
-    const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-    if (animate && !reduce) {
-      shell.style.height = shell.offsetHeight + 'px';        // pin current height
-      shell.classList.add('chatting');
-      requestAnimationFrame(() => { shell.style.height = ACTIVE_H + 'px'; });  // → animate grow
-    } else {
-      shell.classList.add('chatting');
-      shell.style.height = ACTIVE_H + 'px';
+  // ── View plumbing ───────────────────────────────────────────────────────────
+
+  function activeView() { return activeTabId == null ? null : views.get(activeTabId); }
+
+  function isActive(view) { return view === activeView(); }
+
+  function makeHistoryEl() {
+    const el = document.createElement('div');
+    el.className = 'chat-history visible';
+    return el;
+  }
+
+  function scrollToEnd(el) { el.scrollTop = el.scrollHeight; }
+
+  // Reveal the chat area — only when the view the caller wrote to is on screen.
+  function reveal(view) {
+    if (isActive(view)) responseArea.classList.add('visible');
+  }
+
+  // Swap which view's element is attached to #responseArea.
+  function attach(view) {
+    if (responseArea.firstElementChild !== view.el) {
+      responseArea.replaceChildren(view.el);
     }
+    responseArea.classList.toggle('visible', view.el.childElementCount > 0);
+    // Detached elements have scrollHeight 0, so a background view's autoscroll
+    // was a no-op; catch it up now that the element has a layout box.
+    scrollToEnd(view.el);
+    refreshSendButton();
+  }
+
+  // Strip the fragment: in-page #anchor navigation must not wipe a conversation.
+  function pageKey(url) {
+    if (!url) return '';
+    const hash = url.indexOf('#');
+    return hash === -1 ? url : url.slice(0, hash);
+  }
+
+  function newView(tabId, url) {
+    return { tabId, el: makeHistoryEl(), messages: [], url: url || '', controller: null, streaming: false, seq: ++seqCounter };
+  }
+
+  // Get (or build) the view for a tab, resetting it if the page changed.
+  function ensureView(tab) {
+    const existing = views.get(tab.id);
+    if (existing) {
+      existing.seq = ++seqCounter;
+      if (tab.url && pageKey(existing.url) !== pageKey(tab.url)) resetView(existing, tab.url);
+      return existing;
+    }
+
+    const view = newView(tab.id, tab.url);
+    // Only adopt a stored conversation if it belongs to the page now in the tab.
+    // Tab ids are reused across browser restarts, so the id alone proves nothing.
+    const stored = storedChats[tab.id];
+    if (stored && Array.isArray(stored.messages) && stored.messages.length
+        && tab.url && pageKey(stored.url) === pageKey(tab.url)) {
+      view.messages = stored.messages;
+      renderMessages(view);
+    }
+    views.set(tab.id, view);
+    evictStaleViews();
+    return view;
+  }
+
+  // Drop the least-recently-viewed idle views. Messages are already in storage,
+  // so this only releases DOM — the view rebuilds from storage if revisited.
+  function evictStaleViews() {
+    if (views.size <= MAX_VIEWS) return;
+    const candidates = [...views.entries()]
+      .filter(([id, v]) => id !== activeTabId && !v.streaming)
+      .sort((a, b) => a[1].seq - b[1].seq);
+    for (const [id] of candidates) {
+      if (views.size <= MAX_VIEWS) break;
+      views.delete(id);
+    }
+  }
+
+  function resetView(view, url) {
+    view.controller?.abort();   // the answer was about the page we just left
+    setStreaming(view, false);
+    view.messages = [];
+    view.url      = url || '';
+    view.el.replaceChildren();
+    delete storedChats[view.tabId];
+    chrome.storage.local.set({ chats: storedChats });
+    if (isActive(view)) responseArea.classList.remove('visible');
   }
 
   // ── Chat persistence ────────────────────────────────────────────────────
 
-  function saveChat(tabUrl) {
-    const data = { chatMessages };
-    if (tabUrl) data.chatPageUrl = tabUrl;
-    chrome.storage.local.set(data);
+  function saveChat(view) {
+    if (view.tabId == null) return;
+    storedChats[view.tabId] = { url: view.url, messages: view.messages };
+    chrome.storage.local.set({ chats: storedChats });
   }
 
-  function loadChat(saved) {
-    if (!saved || saved.length === 0) return;
-    chatMessages = saved;
-    setChatting(false);   // already a conversation → open tall, no grow animation
-    responseArea.classList.add('visible');
-    chatHistory.classList.add('visible');
-    for (const msg of chatMessages) {
+  function renderMessages(view) {
+    for (const msg of view.messages) {
       if (msg.role === 'user') {
         const wrap = document.createElement('div');
         wrap.className = 'chat-msg user';
         wrap.innerHTML = `<div class="chat-bubble user-bubble">${escHtml(msg.content)}</div><div class="chat-avatar user-av">${USER_AVATAR_SVG}</div>`;
-        chatHistory.appendChild(wrap);
+        view.el.appendChild(wrap);
       } else {
-        chatHistory.appendChild(renderStoredAiTurn(msg));
+        view.el.appendChild(renderStoredAiTurn(msg));
       }
     }
-    chatHistory.scrollTop = chatHistory.scrollHeight;
+    scrollToEnd(view.el);
   }
 
   // Rebuild a completed AI turn (folded rail + answer card) from a stored message
@@ -310,49 +399,126 @@ document.addEventListener('DOMContentLoaded', () => {
     return wrap;
   }
 
-  function clearChat() {
-    chatMessages = [];
-    chatHistory.innerHTML = '';
-    responseArea.classList.remove('visible');
-    chatHistory.classList.remove('visible');
-    shell.classList.remove('chatting');
-    shell.style.height = '';                 // back to the compact empty state
-    chrome.storage.local.remove('chatMessages');
+  function clearActiveChat() {
+    const view = activeView();
+    if (view) resetView(view, view.url);
   }
 
   // ── Load saved state ───────────────────────────────────────────────────────
 
-  chrome.storage.local.get(
-    ['apiKeys', 'toolKeys', 'apiProvider', 'apiKey', 'selectedProvider', 'selectedModelId', 'chatMessages', 'chatPageUrl'],
-    async (res) => {
-      savedApiKeys  = res.apiKeys  || {};
-      savedToolKeys = res.toolKeys || {};
+  async function loadSettings() {
+    const res = await chrome.storage.local.get(
+      ['apiKeys', 'toolKeys', 'apiProvider', 'apiKey', 'selectedProvider', 'selectedModelId']
+    );
+    savedApiKeys  = res.apiKeys  || {};
+    savedToolKeys = res.toolKeys || {};
 
-      // Migrate legacy single-key storage
-      if (res.apiProvider && res.apiKey && !savedApiKeys[res.apiProvider])
-        savedApiKeys[res.apiProvider] = res.apiKey;
+    // Migrate legacy single-key storage
+    if (res.apiProvider && res.apiKey && !savedApiKeys[res.apiProvider])
+      savedApiKeys[res.apiProvider] = res.apiKey;
 
-      const lastProvider = res.selectedProvider && savedApiKeys[res.selectedProvider]
-        ? res.selectedProvider : null;
-      selectedProvider = lastProvider || PROVIDER_ORDER.find(p => savedApiKeys[p]) || null;
+    const lastProvider = res.selectedProvider && savedApiKeys[res.selectedProvider]
+      ? res.selectedProvider : null;
+    selectedProvider = lastProvider || PROVIDER_ORDER.find(p => savedApiKeys[p]) || null;
 
-      if (selectedProvider) {
-        const models = MODELS[selectedProvider];
-        selectedModel = models.find(m => m.id === res.selectedModelId) || models[0];
-      }
-
-      renderProviderBtn();
-      renderModelBtn();
-
-      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      const currentUrl = tab?.url || '';
-      if (res.chatPageUrl && res.chatPageUrl !== currentUrl) {
-        clearChat();
-      } else {
-        loadChat(res.chatMessages);
-      }
+    if (selectedProvider) {
+      const models = MODELS[selectedProvider];
+      selectedModel = models.find(m => m.id === res.selectedModelId) || models[0];
     }
-  );
+
+    renderProviderBtn();
+    renderModelBtn();
+  }
+
+  // Build `storedChats`: migrate the pre-side-panel flat keys, then drop entries
+  // whose tab is gone. Tab ids are recycled across restarts, so this prunes the
+  // obvious dead ones; ensureView() still URL-checks before adopting a chat.
+  async function loadChats(activeTab) {
+    const res   = await chrome.storage.local.get(['chats', 'chatMessages', 'chatPageUrl']);
+    const chats = { ...(res.chats || {}) };
+
+    const legacy = Array.isArray(res.chatMessages) ? res.chatMessages : null;
+    if (legacy?.length && activeTab?.url && res.chatPageUrl
+        && pageKey(res.chatPageUrl) === pageKey(activeTab.url)) {
+      chats[activeTab.id] = { url: activeTab.url, messages: legacy };
+    }
+    if (res.chatMessages !== undefined || res.chatPageUrl !== undefined) {
+      chrome.storage.local.remove(['chatMessages', 'chatPageUrl']);
+    }
+
+    const live = new Set((await chrome.tabs.query({})).map(t => String(t.id)));
+    storedChats = {};
+    for (const [id, entry] of Object.entries(chats)) {
+      if (live.has(id)) storedChats[id] = entry;
+    }
+    chrome.storage.local.set({ chats: storedChats });
+  }
+
+  // ── Active-page indicator ──────────────────────────────────────────────────
+
+  pageFavicon.addEventListener('error', () => pageFavicon.removeAttribute('src'));
+
+  function renderPageIndicator(tab) {
+    let host = '';
+    try { host = new URL(tab?.url || '').hostname.replace(/^www\./, ''); }
+    catch { /* chrome://, about:, a local file — nothing worth showing */ }
+
+    if (!host) { pageIndicator.classList.remove('visible'); return; }
+    pageHost.textContent = host;
+    pageHost.title       = tab.url;
+    if (tab.favIconUrl) pageFavicon.src = tab.favIconUrl;
+    else pageFavicon.removeAttribute('src');
+    pageIndicator.classList.add('visible');
+  }
+
+  // ── Tab tracking — the panel persists, so it has to follow the browser ─────
+
+  let panelWindowId = -1;   // chrome.windows.WINDOW_ID_NONE
+  let pendingTabId  = null;
+
+  async function showTab(tabId) {
+    pendingTabId = tabId;
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    // Fast switching can resolve these out of order — only the newest wins.
+    if (!tab || pendingTabId !== tabId) return;
+    activeTabId = tab.id;
+    attach(ensureView(tab));
+    renderPageIndicator(tab);
+  }
+
+  // onActivated/onUpdated fire for every window; this panel owns exactly one.
+  chrome.tabs.onActivated.addListener(({ tabId, windowId }) => {
+    if (windowId !== panelWindowId) return;
+    showTab(tabId);
+  });
+
+  chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+    if (tab.windowId !== panelWindowId) return;
+    if (changeInfo.url) {
+      const view = views.get(tabId);
+      if (view && pageKey(view.url) !== pageKey(changeInfo.url)) resetView(view, changeInfo.url);
+      else if (view) view.url = changeInfo.url;   // same page, new fragment
+    }
+    // Favicon and title land after the URL, so refresh the header on those too.
+    if (tabId === activeTabId && (changeInfo.url || changeInfo.favIconUrl || changeInfo.title)) {
+      renderPageIndicator(tab);
+    }
+  });
+
+  chrome.tabs.onRemoved.addListener((tabId) => {
+    views.get(tabId)?.controller?.abort();
+    views.delete(tabId);
+    delete storedChats[tabId];   // background.js clears the persisted copy
+  });
+
+  (async () => {
+    await loadSettings();
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (tab?.windowId != null) panelWindowId = tab.windowId;
+    await loadChats(tab);
+    if (tab?.id != null) await showTab(tab.id);
+    else refreshSendButton();
+  })();
 
   // ── UI helpers ─────────────────────────────────────────────────────────────
 
@@ -363,8 +529,6 @@ document.addEventListener('DOMContentLoaded', () => {
   function escHtml(s) {
     return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
   }
-
-  function scrollToEnd() { chatHistory.scrollTop = chatHistory.scrollHeight; }
 
   // ── Card + rail builders (shared by live streaming and history replay) ───────
 
@@ -451,9 +615,8 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   // Live streaming controller for one AI turn (reasoning rail + answer card)
-  function createAiTurn(provider, model) {
-    responseArea.classList.add('visible');
-    chatHistory.classList.add('visible');
+  function createAiTurn(view, provider, model) {
+    reveal(view);
 
     const wrap = document.createElement('div');
     wrap.className = 'chat-msg ai';
@@ -473,8 +636,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
     turnEl.append(rail, card);
     wrap.appendChild(turnEl);
-    chatHistory.appendChild(wrap);
-    scrollToEnd();
+    view.el.appendChild(wrap);
+    scrollToEnd(view.el);
 
     const startTs = Date.now();
     const steps   = [];         // persisted: {kind:'reason'|'tool', ...}
@@ -501,7 +664,7 @@ document.addEventListener('DOMContentLoaded', () => {
         answer += delta;
         card.style.display = '';
         body.innerHTML = renderMarkdown(answer);
-        scrollToEnd();
+        scrollToEnd(view.el);
       },
       onTool(tool) {
         dropWaiting();
@@ -516,7 +679,7 @@ document.addEventListener('DOMContentLoaded', () => {
         rail.appendChild(el);
         if (isObj && tool.id != null) toolEls[tool.id] = { el, item };
         toolCount++;
-        scrollToEnd();
+        scrollToEnd(view.el);
       },
       onToolResult(res) {
         const ref = res && res.id != null ? toolEls[res.id] : null;
@@ -528,7 +691,7 @@ document.addEventListener('DOMContentLoaded', () => {
           ref.el.querySelector('.rail-dot').innerHTML = TICK_ICON;
           if (short) ref.el.querySelector('.rail-result').textContent = short;
         }
-        scrollToEnd();
+        scrollToEnd(view.el);
       },
       // Finalize: fold the rail, stamp footer, return the record to persist
       finish() {
@@ -549,7 +712,7 @@ document.addEventListener('DOMContentLoaded', () => {
         card.style.display = '';
         if (!answer.trim()) body.innerHTML = `<p class="ai-empty">Done.</p>`;
         addCardFooter(card, ts, answer);
-        scrollToEnd();
+        scrollToEnd(view.el);
         return { content: answer, provider, model, ts, durationMs, steps };
       },
       fail(text) {
@@ -558,7 +721,7 @@ document.addEventListener('DOMContentLoaded', () => {
         card.style.display = '';
         body.className = 'ai-card-body error';
         body.textContent = text;
-        scrollToEnd();
+        scrollToEnd(view.el);
       },
       discard() { wrap.remove(); },
       hasAnswer() { return !!answer.trim(); },
@@ -567,14 +730,14 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   // Standalone error bubble (used before a turn exists, e.g. missing key)
-  function showError(text) {
-    responseArea.classList.add('visible');
-    chatHistory.classList.add('visible');
+  function showError(text, view = activeView()) {
+    if (!view) { console.error('SiteWhisper:', text); return; }   // no tab bound yet
+    reveal(view);
     const wrap = document.createElement('div');
     wrap.className = 'chat-msg ai';
     wrap.innerHTML = `<div class="ai-turn"><div class="ai-card"><div class="ai-card-body error">${escHtml(text)}</div></div></div>`;
-    chatHistory.appendChild(wrap);
-    scrollToEnd();
+    view.el.appendChild(wrap);
+    scrollToEnd(view.el);
   }
 
   // ── Provider / model buttons ───────────────────────────────────────────────
@@ -614,7 +777,7 @@ document.addEventListener('DOMContentLoaded', () => {
         {
           icon: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2m3 0v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6"/></svg>`,
           label: 'Clear Chat', sub: 'Start a new conversation',
-          action: () => { clearChat(); hideOverlay(); },
+          action: () => { clearActiveChat(); hideOverlay(); },
         },
       ];
 
@@ -717,8 +880,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // ── Context fetching ───────────────────────────────────────────────────────
 
-  function getPageText(tab, cb, onErr) {
-    const fail = onErr || showError;
+  function getPageText(tab, cb, fail) {
     if (!tab || tab.id == null) { fail('Cannot access this page (try a regular http/https page).'); return; }
 
     // Inject on-demand so it works on tabs that were already open before the
@@ -740,13 +902,14 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // ── Main handler ───────────────────────────────────────────────────────────
 
-  async function handleQuery(tab, query, turn) {
+  async function handleQuery(tab, view, query, turn) {
     const key = savedApiKeys[selectedProvider];
     if (!key) { turn.fail('No API key for this provider. Open Settings (⚙).'); return; }
 
     getPageText(tab, async (text) => {
-      activeController = new AbortController();
-      setStopMode(true);
+      const controller = new AbortController();
+      view.controller  = controller;
+      setStreaming(view, true);
 
       let response;
       try {
@@ -754,7 +917,7 @@ document.addEventListener('DOMContentLoaded', () => {
             query,
             text:       text || '',
             model:      selectedModel?.id,
-            history:    chatMessages.slice(0, -1),
+            history:    view.messages.slice(0, -1),
             tool_keys:  savedToolKeys,
           };
           if (selectedProvider === 'claude' && savedApiKeys.gemini)
@@ -763,18 +926,18 @@ document.addEventListener('DOMContentLoaded', () => {
           response = await fetch(`${BACKEND}/chat`, {
           method:  'POST',
           headers: { 'Content-Type': 'application/json', 'Token': key, 'Provider': selectedProvider },
-          signal:  activeController.signal,
+          signal:  controller.signal,
           body: JSON.stringify(payload),
         });
       } catch (err) {
-        setStopMode(false);
+        setStreaming(view, false);
         if (err.name === 'AbortError') { turn.discard(); return; }
         turn.fail('Could not reach backend: ' + err.message);
         return;
       }
 
       if (!response.ok) {
-        setStopMode(false);
+        setStreaming(view, false);
         try { const d = await response.json(); turn.fail(d.detail || 'Backend error.'); }
         catch { turn.fail('Backend error ' + response.status); }
         return;
@@ -787,23 +950,23 @@ document.addEventListener('DOMContentLoaded', () => {
         onTool:       (tool) => turn.onTool(tool),
         onToolResult: (res)  => turn.onToolResult(res),
         onText:       (t)    => turn.onText(t),
-        onError:      (msg)  => { if (!activeController?.signal.aborted) { errored = true; turn.fail(msg); } },
+        onError:      (msg)  => { if (!controller.signal.aborted) { errored = true; turn.fail(msg); } },
       });
 
-      const aborted = activeController?.signal.aborted;
-      setStopMode(false);
+      const aborted = controller.signal.aborted;
+      setStreaming(view, false);
       if (errored) return;
 
       if (aborted && !turn.hasAnswer()) { turn.discard(); return; }
 
       const rec = turn.finish();
       if (rec.content.trim() || rec.steps.length) {
-        chatMessages.push({ role: 'assistant', ...rec });
-        saveChat();
+        view.messages.push({ role: 'assistant', ...rec });
+        saveChat(view);
       } else {
         turn.discard();
       }
-    }, (m) => { setStopMode(false); turn.fail(m); });
+    }, (m) => { setStreaming(view, false); turn.fail(m); });
   }
 
   // ── Input handling ─────────────────────────────────────────────────────────
@@ -811,7 +974,7 @@ document.addEventListener('DOMContentLoaded', () => {
   input.addEventListener('input', () => {
     input.style.height = 'auto';
     input.style.height = Math.min(input.scrollHeight, 130) + 'px';
-    askBtn.disabled = !input.value.trim();
+    refreshSendButton();   // must not clobber stop mode mid-stream
   });
 
   input.addEventListener('keydown', (e) => {
@@ -822,8 +985,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   askBtn.addEventListener('click', async () => {
     if (askBtn.classList.contains('stop-mode')) {
-      activeController?.abort();
-      setStopMode(false);
+      activeView()?.controller?.abort();   // handleQuery clears streaming state
       return;
     }
 
@@ -837,21 +999,29 @@ document.addEventListener('DOMContentLoaded', () => {
     hideOverlay();
 
     try {
+      // Resolve the tab at send time — in a persistent panel the user may have
+      // switched pages since the last question.
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (!tab || tab.id == null) {
+        showError('Cannot access this page (try a regular http/https page).');
+        return;
+      }
+      activeTabId = pendingTabId = tab.id;   // also cancels any in-flight showTab
+      const view  = ensureView(tab);
+      if (tab.url) view.url = tab.url;
+      attach(view);
 
-      responseArea.classList.add('visible');
-      chatHistory.classList.add('visible');
-      setChatting(true);   // first message → window grows, input docks to the bottom
+      reveal(view);
       const userWrap = document.createElement('div');
       userWrap.className = 'chat-msg user';
       userWrap.innerHTML = `<div class="chat-bubble user-bubble">${escHtml(query)}</div><div class="chat-avatar user-av">${USER_AVATAR_SVG}</div>`;
-      chatHistory.appendChild(userWrap);
-      chatHistory.scrollTop = chatHistory.scrollHeight;
-      chatMessages.push({ role: 'user', content: query });
-      saveChat(tab.url);
+      view.el.appendChild(userWrap);
+      scrollToEnd(view.el);
+      view.messages.push({ role: 'user', content: query });
+      saveChat(view);
 
-      const turn = createAiTurn(selectedProvider, selectedModel?.label);
-      handleQuery(tab, query, turn);
+      const turn = createAiTurn(view, selectedProvider, selectedModel?.label);
+      handleQuery(tab, view, query, turn);
     } catch (err) {
       showError('Unexpected error: ' + err.message);
     }
