@@ -45,6 +45,9 @@
         </span>
       </div>
       <div class="header-actions">
+        <!-- Restricted asks before consequential page actions; unrestricted does not.
+             Session-scoped — it always reverts to Restricted when the panel reopens. -->
+        <button class="mode-pill" id="modeBtn" type="button" aria-pressed="false">Restricted</button>
         <!-- One tap to start over — no need to go into the menu for it -->
         <button class="header-btn new-chat-btn" id="newChatBtn" title="New chat">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">

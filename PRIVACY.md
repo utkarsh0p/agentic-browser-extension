@@ -14,14 +14,13 @@ The page text and your question are sent to our backend server (api.cember.in) t
 
 Your API keys (for Claude, Gemini, or OpenAI) are stored locally in your browser using chrome.storage.local. They are sent to our backend server only to authenticate requests with the respective AI provider — they are never logged or stored on our server.
 
-Optional tool keys (Tavily, Composio) are also stored locally and sent to our backend only when those tools are used during a session.
+An optional Composio tool key is also stored locally and sent to our backend only when those tools are used during a session.
 
 ## Third-party services
 
 When you ask a question, the page content and your query may be processed by the following services depending on your configuration:
 
 - **Anthropic** (Claude), **Google** (Gemini), or **OpenAI** (GPT) — for generating AI answers
-- **Tavily** — for web search, if you provide a Tavily API key
 - **Composio** — for app integrations (Gmail, Google Docs, etc.), if you provide a Composio API key
 
 Each provider's own privacy policy applies to that interaction.

@@ -733,6 +733,15 @@ body {
   padding: 0 0 8px;
 }
 .ai-time { font-size: var(--fs-2xs); color: #b6b6ae; }
+.ai-interrupted {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-right: auto;
+  font-size: var(--fs-2xs);
+  color: #a8a8a0;
+}
+.ai-interrupted svg { opacity: 0.7; }
 .copy-btn {
   display: inline-flex;
   align-items: center;
@@ -866,6 +875,11 @@ body {
   background: var(--accent);
 }
 .rail-step.done .rail-dot svg { width: 8px; height: 8px; }
+.rail-step.stopped .rail-dot {
+  border-color: #cfcfc7;
+  background: #eeeee8;
+}
+.rail-step.stopped .rail-body { color: #a8a8a0; }
 
 @keyframes railPulse {
   0%   { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 45%, transparent); }
@@ -904,6 +918,103 @@ body {
   white-space: nowrap;
 }
 .rail-elapsed:empty { display: none; }
+
+/* ── Human-in-the-loop rows ───────────────────────────────────────────────────
+   The agent is paused and waiting on the reader, so this row has to look like it
+   wants something — not like another passive status line. */
+.rail-step.hitl .hitl-body {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, #e6e6e0);
+  border-left: 2px solid var(--accent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--accent) 4%, #fafaf8);
+}
+.rail-step.hitl.done .hitl-body,
+.rail-step.hitl.stopped .hitl-body {
+  padding: 0;
+  border: none;
+  background: none;
+}
+.hitl-item {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+.hitl-item + .hitl-item {
+  padding-top: 7px;
+  border-top: 1px solid #ece9e1;
+}
+.hitl-question {
+  font-size: var(--fs-sm);
+  line-height: 1.45;
+  color: #3a3a36;
+}
+.hitl-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+.hitl-btn {
+  font: inherit;
+  font-size: var(--fs-xs);
+  font-weight: 500;
+  padding: 4px 10px;
+  border: 1px solid #dcd9d1;
+  border-radius: 6px;
+  background: #fff;
+  color: #4a4a44;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
+}
+.hitl-btn:hover { background: #f2f0ea; border-color: #c8c5bc; }
+.hitl-btn.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+.hitl-btn.primary:hover { filter: brightness(1.15); }
+.hitl-input {
+  flex: 1 1 120px;
+  min-width: 0;
+  font: inherit;
+  font-size: var(--fs-sm);
+  padding: 4px 8px;
+  border: 1px solid #dcd9d1;
+  border-radius: 6px;
+  background: #fff;
+  color: #1a1a1a;
+}
+.hitl-input:focus { outline: none; border-color: var(--accent); }
+.hitl-input::placeholder { color: #b0ada4; }
+
+/* ── Restricted / Unrestricted pill ───────────────────────────────────────────
+   Unrestricted is a state you can forget you left on, so it is loud on purpose. */
+.mode-pill {
+  font: inherit;
+  font-size: var(--fs-2xs);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  padding: 3px 8px;
+  margin-right: 2px;
+  border: 1px solid #dcd9d1;
+  border-radius: 999px;
+  background: #f2f0ea;
+  color: #77746c;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+.mode-pill:hover { border-color: #c8c5bc; color: #4a4a44; }
+.mode-pill.unrestricted {
+  background: #b54a4a;
+  border-color: #b54a4a;
+  color: #fff;
+}
+.mode-pill.unrestricted:hover { filter: brightness(1.08); color: #fff; }
 .rail-reason {
   font-size: var(--fs-sm);
   font-style: italic;

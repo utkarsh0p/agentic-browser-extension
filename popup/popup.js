@@ -1,6 +1,6 @@
 // ── Backend URL — toggle one line to switch between local and production ──────
-//const BACKEND = 'http://localhost:5000';        // ← local testing
-const BACKEND = 'https://api.cember.in';          // ← production
+const BACKEND = 'http://localhost:5000';        // ← local testing
+//const BACKEND = 'https://api.cember.in';          // ← production
 
 // ── Avatars ───────────────────────────────────────────────────────────────────
 
@@ -95,7 +95,6 @@ function formatTime(ts) {
 const TOOL_DISPLAY = {
   search_page:                        'Searching the page',
   summarize_page:                     'Summarizing the page',
-  web_search:                         'Searching the web',
   COMPOSIO_SEARCH_TOOLS:              'Finding tools',
   COMPOSIO_CHECK_ACTIVE_CONNECTIONS:  'Checking connections',
   COMPOSIO_INITIATE_CONNECTION:       'Connecting',
@@ -164,10 +163,9 @@ const PROVIDER_ORDER = ['claude', 'gemini', 'openai'];
 // Provider keys live in storage under `apiKeys`, tool keys under `toolKeys`.
 // Carried over from the options page this panel replaced.
 
-const TOOL_ORDER = ['tavily', 'composio'];
+const TOOL_ORDER = ['composio'];
 
 const TOOLS = {
-  tavily:   { label: 'Tavily',   sub: 'Web Search',       glyph: 'T' },
   composio: { label: 'Composio', sub: 'App Integrations', glyph: 'C' },
 };
 
@@ -175,7 +173,6 @@ const KEY_HINTS = {
   claude:   { placeholder: 'sk-ant-api03-…', host: 'console.anthropic.com',  url: 'https://console.anthropic.com/',       prefix: 'sk-ant-' },
   gemini:   { placeholder: 'AIzaSy…',        host: 'aistudio.google.com',    url: 'https://aistudio.google.com/apikey',   prefix: 'AIza'    },
   openai:   { placeholder: 'sk-proj-…',      host: 'platform.openai.com',    url: 'https://platform.openai.com/api-keys', prefix: 'sk-'     },
-  tavily:   { placeholder: 'tvly-…',         host: 'app.tavily.com',         url: 'https://app.tavily.com/home',          prefix: 'tvly-'   },
   composio: { placeholder: 'ak_…',           host: 'app.composio.dev',       url: 'https://app.composio.dev/',            prefix: 'ak_'     },
 };
 
@@ -202,7 +199,19 @@ const MODELS = {
 
 // ── Shared SSE stream reader ───────────────────────────────────────────────────
 
-async function readSSEStream(response, { onText, onMeta, onError, onTool, onToolResult }) {
+// Both transports carry the same frame vocabulary, so routing lives in one place.
+// Returns true when the frame ends the stream.
+function dispatchFrame(parsed, h) {
+  if (parsed.error)       { h.onError?.(parsed.error); return true; }
+  if (parsed.done)        return true;                       // WebSocket's [DONE]
+  if (parsed.status)      { h.onMeta?.(parsed); return false; }
+  if (parsed.tool)        { h.onTool?.(parsed.tool); return false; }
+  if (parsed.tool_result) { h.onToolResult?.(parsed.tool_result); return false; }
+  if (parsed.text)        h.onText?.(parsed.text);
+  return false;
+}
+
+async function readSSEStream(response, handlers) {
   const reader  = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
@@ -218,18 +227,104 @@ async function readSSEStream(response, { onText, onMeta, onError, onTool, onTool
         const raw = line.slice(6).trim();
         if (raw === '[DONE]') return;
         try {
-          const parsed = JSON.parse(raw);
-          if (parsed.error)       { onError?.(parsed.error); return; }
-          if (parsed.status)      { onMeta?.(parsed); continue; }
-          if (parsed.tool)        { onTool?.(parsed.tool); continue; }
-          if (parsed.tool_result) { onToolResult?.(parsed.tool_result); continue; }
-          if (parsed.text)        onText?.(parsed.text);
+          if (dispatchFrame(JSON.parse(raw), handlers)) return;
         } catch { /* skip malformed line */ }
       }
     }
   } catch (err) {
-    onError?.(err.message);
+    handlers.onError?.(err.message);
   }
+}
+
+// "restricted" asks before consequential page actions; "unrestricted" runs them without
+// asking. Deliberately a plain variable and NOT chrome.storage: the side panel's document
+// is torn down when the panel closes, so this resets to restricted on every reopen —
+// unrestricted has to be a fresh decision each time, never something left on by accident.
+let agentMode = 'restricted';
+
+// Raised when the socket never opened, which is the one case worth retrying over POST:
+// an older backend, or a proxy that drops upgrades. A socket that opens and then fails is
+// a real error and must surface as one.
+class TransportUnavailable extends Error {}
+
+// A backend without /chat/ws refuses the upgrade, but a proxy that blackholes it just
+// hangs — so waiting for the browser's own timeout is not an option.
+const WS_CONNECT_TIMEOUT_MS = 2500;
+// …and once it has failed, stop paying that cost on every single question. Re-armed after
+// a while so a backend deployed mid-session is picked up without a reload.
+const WS_RETRY_AFTER_MS = 10 * 60 * 1000;
+let wsUnavailableUntil = 0;
+
+function wsWorthTrying() { return Date.now() >= wsUnavailableUntil; }
+function markWsUnavailable() { wsUnavailableUntil = Date.now() + WS_RETRY_AFTER_MS; }
+
+// The socket exists so page tools can run in the browser mid-turn: the server sends a
+// `client_tool` frame and waits for the matching `client_tool_result`, which keeps the
+// whole task inside one agent run.
+function runWsQuery(payload, handlers, signal) {
+  return new Promise((resolve, reject) => {
+    const url = BACKEND.replace(/^http/, 'ws') + '/chat/ws';
+    let ws;
+    try { ws = new WebSocket(url); } catch (err) { reject(new TransportUnavailable(err.message)); return; }
+
+    let opened = false, settled = false;
+    const openTimer = setTimeout(() => {
+      if (!opened) finish(new TransportUnavailable('socket did not open in time'));
+    }, WS_CONNECT_TIMEOUT_MS);
+
+    const finish = (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(openTimer);
+      try { ws.close(); } catch { /* already closing */ }
+      err ? reject(err) : resolve();
+    };
+
+    const onAbort = () => finish(new DOMException('aborted', 'AbortError'));
+    signal?.addEventListener('abort', onAbort, { once: true });
+
+    ws.onopen = () => { opened = true; clearTimeout(openTimer); ws.send(JSON.stringify(payload)); };
+
+    ws.onmessage = async (ev) => {
+      let parsed;
+      try { parsed = JSON.parse(ev.data); } catch { return; }
+
+      // The graph has actually paused for a human. Same round-trip shape as a client
+      // tool, but the answer is a decisions object rather than text.
+      if (parsed.hitl) {
+        const { id, request } = parsed.hitl;
+        let decisions = null;
+        try {
+          decisions = await handlers.onHitl?.(request);
+        } catch {
+          decisions = null;
+        }
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ hitl_decision: { id, decisions } }));
+        }
+        return;
+      }
+
+      if (parsed.client_tool) {
+        const { id, name, args } = parsed.client_tool;
+        let result;
+        try {
+          result = await handlers.onClientTool?.(name, args || {});
+        } catch (err) {
+          result = 'The browser could not run that action: ' + (err?.message || err);
+        }
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ client_tool_result: { id, result: String(result ?? '') } }));
+        }
+        return;
+      }
+
+      if (dispatchFrame(parsed, handlers)) finish();
+    };
+
+    ws.onerror  = () => { if (!opened) finish(new TransportUnavailable('socket error')); };
+    ws.onclose  = () => finish(opened ? undefined : new TransportUnavailable('socket closed before opening'));
+  });
 }
 
 // ── Init ──────────────────────────────────────────────────────────────────────
@@ -285,6 +380,7 @@ document.addEventListener('DOMContentLoaded', () => {
   let seqCounter   = 0;
 
   const STOP_ICON = `<svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>`;
+  const STOP_BADGE_ICON = `<svg width="8" height="8" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>`;
   const SEND_ICON = `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M12 5l7 7-7 7"/></svg>`;
 
   // Send button reflects the ACTIVE view only — a background tab's stream must
@@ -452,13 +548,14 @@ document.addEventListener('DOMContentLoaded', () => {
         }
       }
       turnEl.appendChild(rail);
-      foldRail(turnEl, rail, toolCount || steps.length, msg.durationMs);
+      foldRail(turnEl, rail, toolCount || steps.length, msg.durationMs, { stopped: !!msg.interrupted });
     }
 
     const { card, body } = makeCard(msg.provider, msg.model);
-    body.innerHTML = renderMarkdown(msg.content || '');
+    if ((msg.content || '').trim()) body.innerHTML = renderMarkdown(msg.content);
+    else body.innerHTML = emptyBodyHTML(msg.interrupted);
     turnEl.appendChild(card);
-    addCardFooter(card, msg.ts, msg.content || '');
+    addCardFooter(card, msg.ts, msg.content || '', { interrupted: !!msg.interrupted });
     wrap.appendChild(turnEl);
     return wrap;
   }
@@ -565,8 +662,15 @@ document.addEventListener('DOMContentLoaded', () => {
     if (tab.windowId !== panelWindowId) return;
     if (changeInfo.url) {
       const view = views.get(tabId);
-      if (view && pageKey(view.url) !== pageKey(changeInfo.url)) resetView(view, changeInfo.url);
-      else if (view) view.url = changeInfo.url;   // same page, new fragment
+      if (view && pageKey(view.url) !== pageKey(changeInfo.url)) {
+        // A navigation during a live turn is usually the agent's own doing — clearing the
+        // chat here would destroy the very conversation driving it. Follow the URL and
+        // keep the history; only an idle tab gets a fresh chat for a new page.
+        if (view.streaming) view.url = changeInfo.url;
+        else resetView(view, changeInfo.url);
+      } else if (view) {
+        view.url = changeInfo.url;   // same page, new fragment
+      }
     }
     // Favicon and title land after the URL, so refresh the header on those too.
     if (tabId === activeTabId && (changeInfo.url || changeInfo.favIconUrl || changeInfo.title)) {
@@ -623,9 +727,21 @@ document.addEventListener('DOMContentLoaded', () => {
     return { card, body };
   }
 
-  function addCardFooter(card, ts, rawText) {
+  // Body text for a turn that produced no answer. An interrupted one says so rather than
+  // claiming it finished.
+  function emptyBodyHTML(interrupted) {
+    return `<p class="ai-empty">${interrupted ? 'Stopped before answering.' : 'Done.'}</p>`;
+  }
+
+  function addCardFooter(card, ts, rawText, { interrupted = false } = {}) {
     const footer = document.createElement('div');
     footer.className = 'ai-card-footer';
+    if (interrupted) {
+      const badge = document.createElement('span');
+      badge.className = 'ai-interrupted';
+      badge.innerHTML = `${STOP_BADGE_ICON}<span>Interrupted</span>`;
+      footer.appendChild(badge);
+    }
     const time = document.createElement('span');
     time.className = 'ai-time';
     time.textContent = formatTime(ts);
@@ -669,6 +785,167 @@ document.addEventListener('DOMContentLoaded', () => {
     return el;
   }
 
+  // Values the user typed into a `secret` prompt. They are held here and swapped in at
+  // the moment of typing, so a password reaches the page WITHOUT ever reaching the model.
+  // Module-scoped, so it dies with the panel and is never persisted.
+  const secretVault = new Map();
+  let secretSeq = 0;
+
+  function stashSecret(value) {
+    const token = `__sw_secret_${++secretSeq}__`;
+    secretVault.set(token, value);
+    return token;
+  }
+
+  // Swap placeholders back for real values on their way to the page. Exact-match only: if
+  // the model mangles a token, the fill types the token and fails visibly rather than
+  // leaking or silently doing the wrong thing.
+  function fillSecrets(actions) {
+    return actions.map((a) => (
+      a && typeof a.text === 'string' && secretVault.has(a.text)
+        ? { ...a, text: secretVault.get(a.text) }
+        : a
+    ));
+  }
+
+  // One block per action the middleware is holding. Resolves with a decision array in the
+  // same order — the count is a hard contract, the middleware raises without it.
+  function railHitlEl(request, onComplete) {
+    const requests = Array.isArray(request?.action_requests) ? request.action_requests : [];
+    const configs  = new Map(
+      (request?.review_configs || []).map((c) => [c.action_name, c])
+    );
+
+    const wrap = document.createElement('div');
+    wrap.className = 'rail-step hitl active';
+    const dot = document.createElement('span');
+    dot.className = 'rail-dot';
+    const body = document.createElement('span');
+    body.className = 'rail-body hitl-body';
+    wrap.append(dot, body);
+
+    const decisions = new Array(requests.length).fill(null);
+    let settled = false;
+
+    const settle = (summary) => {
+      if (settled) return;
+      settled = true;
+      wrap.classList.remove('active');
+      wrap.classList.add('done');
+      dot.innerHTML = TICK_ICON;
+      body.innerHTML = `<span class="rail-tool-label">${escHtml(summary)}</span>`;
+      onComplete(decisions.map((d) => d || { type: 'reject', message: 'No decision was made.' }), summary);
+    };
+
+    const record = (i, decision, summary) => {
+      if (settled || decisions[i]) return;
+      decisions[i] = decision;
+      if (decisions.every(Boolean)) settle(summary);
+    };
+
+    requests.forEach((req, i) => {
+      const cfg     = configs.get(req?.name) || {};
+      const allowed = cfg.allowed_decisions || ['approve', 'reject'];
+      const block   = document.createElement('span');
+      block.className = 'hitl-item';
+
+      // "respond" means the human's answer IS the tool result — the ask_user shape.
+      if (allowed.includes('respond')) {
+        const a        = req?.args || {};
+        const kind     = String(a.kind || 'text').toLowerCase();
+        const question = String(a.question || 'The agent needs some input.');
+
+        const q = document.createElement('span');
+        q.className = 'hitl-question';
+        q.textContent = question;
+        block.appendChild(q);
+
+        const answer = (text, shown) => {
+          const message = kind === 'secret'
+            ? `The user supplied the value. When you need to enter it, use exactly this ` +
+              `placeholder as the text: ${stashSecret(text)}`
+            : text;
+          record(i, { type: 'respond', message }, shown);
+        };
+
+        if (kind === 'choice' && Array.isArray(a.options) && a.options.length) {
+          const row = document.createElement('span');
+          row.className = 'hitl-actions';
+          a.options.slice(0, 6).forEach((opt) => {
+            const b = document.createElement('button');
+            b.type = 'button';
+            b.className = 'hitl-btn';
+            b.textContent = String(opt);
+            b.addEventListener('click', () => answer(String(opt), `You chose "${opt}"`));
+            row.appendChild(b);
+          });
+          block.appendChild(row);
+        } else {
+          const row = document.createElement('span');
+          row.className = 'hitl-actions';
+          const field = document.createElement('input');
+          field.className = 'hitl-input';
+          field.type = kind === 'secret' ? 'password' : 'text';
+          field.placeholder = kind === 'secret' ? 'Value stays in the browser' : 'Your answer…';
+          const send = document.createElement('button');
+          send.type = 'button';
+          send.className = 'hitl-btn primary';
+          send.textContent = 'Send';
+          const submit = () => {
+            const v = field.value.trim();
+            if (!v) { field.focus(); return; }
+            // A secret is never echoed into the rail, and `steps` is persisted.
+            answer(v, kind === 'secret' ? 'You provided a value' : `You answered "${v}"`);
+          };
+          send.addEventListener('click', submit);
+          field.addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(); });
+          row.append(field, send);
+          block.appendChild(row);
+          setTimeout(() => field.focus(), 0);
+        }
+      } else {
+        // Approval.
+        const q = document.createElement('span');
+        q.className = 'hitl-question';
+        q.textContent = req?.description || `Allow ${req?.name || 'this action'}?`;
+        const row = document.createElement('span');
+        row.className = 'hitl-actions';
+
+        const approve = document.createElement('button');
+        approve.type = 'button';
+        approve.className = 'hitl-btn primary';
+        approve.textContent = 'Approve';
+        approve.addEventListener('click', () => record(i, { type: 'approve' }, 'You approved it'));
+
+        const reject = document.createElement('button');
+        reject.type = 'button';
+        reject.className = 'hitl-btn';
+        reject.textContent = 'Reject';
+        reject.addEventListener('click', () => record(i,
+          { type: 'reject', message: 'The user declined this action.' }, 'You declined it'));
+
+        row.append(approve, reject);
+        block.append(q, row);
+      }
+
+      body.appendChild(block);
+    });
+
+    // The turn was stopped while this prompt was still open. Deliberately does NOT call
+    // onComplete — the graph is gone, and resolving askHuman would push a step and restart
+    // the elapsed ticker on a dead turn.
+    const cancel = () => {
+      if (settled) return;
+      settled = true;
+      wrap.classList.remove('active');
+      wrap.classList.add('stopped');
+      body.innerHTML = `<span class="rail-tool-label">Stopped</span>`;
+    };
+
+    if (!requests.length) settle('Nothing to approve');
+    return { el: wrap, settle, cancel };
+  }
+
   // A retried call collapses into its own row rather than repeating it
   function setRailCount(el, count) {
     const badge = el.querySelector('.rail-count');
@@ -676,12 +953,13 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   // Collapse a finished rail into a "Whispered through N steps · Ns" chip
-  function foldRail(turnEl, railEl, stepCount, durationMs) {
+  function foldRail(turnEl, railEl, stepCount, durationMs, { stopped = false } = {}) {
     const secs = durationMs ? Math.max(1, Math.round(durationMs / 1000)) : null;
     const chip = document.createElement('button');
     chip.type = 'button';
     chip.className = 'trace-chip';
-    const label = `Whispered through ${stepCount} step${stepCount === 1 ? '' : 's'}${secs ? ` · ${secs}s` : ''}`;
+    const verb  = stopped ? 'Stopped after' : 'Whispered through';
+    const label = `${verb} ${stepCount} step${stepCount === 1 ? '' : 's'}${secs ? ` · ${secs}s` : ''}`;
     chip.innerHTML = `<span class="chip-chev">${CHEVRON_ICON}</span><span>${escHtml(label)}</span>`;
     railEl.classList.add('collapsed');
     chip.addEventListener('click', () => {
@@ -748,6 +1026,9 @@ document.addEventListener('DOMContentLoaded', () => {
     const hideWaiting = () => { waiting.remove(); stopTicker(); };
 
     startTicker();
+    // The prompt currently waiting on the user, so a stop can close it out
+    let liveHitl = null;
+
     // Any text collected in the answer body before a tool call was actually reasoning
     function flushAnswerAsReason() {
       const t = answer.trim();
@@ -761,6 +1042,27 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     return {
+      // The graph is paused. Park the rail on a prompt and hand back the user's decisions.
+      askHuman(request) {
+        // Stop the clock: the user reading a prompt is not the agent being slow, and a
+        // ticking counter next to a question reads as a hang.
+        hideWaiting();
+        return new Promise((resolve) => {
+          const hitl = railHitlEl(request, (decisions, summary) => {
+            liveHitl = null;
+            // The summary comes from the row that produced it rather than being scraped
+            // back out of the DOM — `steps` is persisted, so it must never accidentally
+            // capture a secret the row deliberately never displayed.
+            steps.push({ kind: 'reason', text: summary || 'Responded' });
+            showWaiting();          // the agent is working again
+            resolve(decisions);
+          });
+          liveHitl = hitl;
+          rail.appendChild(hitl.el);
+          scrollToEnd(view.el);
+        });
+      },
+
       onText(delta) {
         hideWaiting();
         answer += delta;
@@ -827,10 +1129,34 @@ document.addEventListener('DOMContentLoaded', () => {
           rail.remove();
         }
         card.style.display = '';
-        if (!answer.trim()) body.innerHTML = `<p class="ai-empty">Done.</p>`;
+        if (!answer.trim()) body.innerHTML = emptyBodyHTML(false);
         addCardFooter(card, ts, answer);
         scrollToEnd(view.el);
         return { content: answer, provider, model, ts, durationMs, steps };
+      },
+      // The user hit stop. Same shape as finish(), but the turn is labelled as cut short
+      // instead of being deleted — a vanished bubble leaves the question looking ignored.
+      interrupt() {
+        hideWaiting();
+        liveHitl?.cancel();   // its buttons would otherwise stay live on a dead turn
+        // A tick here would claim a call that never came back had succeeded
+        rail.querySelectorAll('.rail-step.tool.active').forEach(el => {
+          el.classList.remove('active');
+          el.classList.add('stopped');
+          el.querySelector('.rail-dot').innerHTML = '';
+        });
+        const durationMs = Date.now() - startTs;
+        const ts = Date.now();
+        if (toolCount > 0 || steps.length > 0) {
+          foldRail(turnEl, rail, toolCount || steps.length, durationMs, { stopped: true });
+        } else {
+          rail.remove();
+        }
+        card.style.display = '';
+        if (!answer.trim()) body.innerHTML = emptyBodyHTML(true);
+        addCardFooter(card, ts, answer, { interrupted: true });
+        scrollToEnd(view.el);
+        return { content: answer, provider, model, ts, durationMs, steps, interrupted: true };
       },
       fail(text) {
         hideWaiting();
@@ -841,8 +1167,6 @@ document.addEventListener('DOMContentLoaded', () => {
         scrollToEnd(view.el);
       },
       discard() { stopTicker(); wrap.remove(); },
-      hasAnswer() { return !!answer.trim(); },
-      hasSteps()  { return steps.length > 0; },
     };
   }
 
@@ -1134,6 +1458,24 @@ document.addEventListener('DOMContentLoaded', () => {
   setupBtn.addEventListener('click',    () => showOverlay('keys'));
   newChatBtn.addEventListener('click',  () => clearActiveChat());
 
+  const modeBtn = document.getElementById('modeBtn');
+
+  function paintMode() {
+    const open = agentMode === 'unrestricted';
+    modeBtn.classList.toggle('unrestricted', open);
+    modeBtn.textContent = open ? 'Unrestricted' : 'Restricted';
+    modeBtn.title = open
+      ? 'Page actions run without asking. External tools still ask. Click to restrict.'
+      : 'Consequential page actions ask first. Click to allow them without asking.';
+    modeBtn.setAttribute('aria-pressed', String(open));
+  }
+
+  modeBtn.addEventListener('click', () => {
+    agentMode = agentMode === 'unrestricted' ? 'restricted' : 'unrestricted';
+    paintMode();
+  });
+  paintMode();
+
   // ── Context fetching ───────────────────────────────────────────────────────
 
   function getPageText(tab, cb, fail) {
@@ -1156,64 +1498,330 @@ document.addEventListener('DOMContentLoaded', () => {
     );
   }
 
+  // Returns content.js's snapshot response ({ snapshot, generation, ... }) or null if the
+  // page can't provide one. Best-effort by design: a missing snapshot must degrade to
+  // text-only chat, never fail the request.
+  function getPageSnapshot(tab, cb) {
+    if (!tab || tab.id == null) { cb(null); return; }
+
+    const request = (mayInject) => {
+      // Wrapped because a snapshot is a nice-to-have: sendMessage can throw synchronously
+      // on a tab that died mid-request, and that must not take the whole turn down with it.
+      try {
+        chrome.tabs.sendMessage(tab.id, { type: 'SW_SNAPSHOT' }, (res) => {
+          if (chrome.runtime.lastError) {
+            // No receiver. content.js is declared for <all_urls>, but declared scripts
+            // only reach pages loaded *after* the extension did, so older tabs need an
+            // explicit inject before they can answer.
+            if (!mayInject) { cb(null); return; }
+            chrome.scripting.executeScript(
+              { target: { tabId: tab.id }, files: ['content.js'] },
+              () => {
+                if (chrome.runtime.lastError) { cb(null); return; }
+                request(false);
+              }
+            );
+            return;
+          }
+            cb(res && res.ok ? res : null);
+        });
+      } catch {
+        cb(null);
+      }
+    };
+
+    request(true);
+  }
+
+  // ── Page actions (client-side tools) ───────────────────────────────────────
+  // read_page and act execute here, not on the server: the server has no DOM. Over the
+  // socket the agent asks for them mid-run and waits for the answer.
+
+  const SNAP_LINE = /^\[(\d+)\]\s+(\S+)(?:\s+"([^"]*)")?/;
+
+  // The panel needs the element names to judge whether an action is consequential, and the
+  // snapshot text is the only place it has them.
+  function parseSnapshot(text) {
+    const map = new Map();
+    for (const line of String(text || '').split('\n')) {
+      const m = SNAP_LINE.exec(line);
+      if (m) map.set(Number(m[1]), { role: m[2], name: m[3] || '' });
+    }
+    return map;
+  }
+
+  // content.js rejects actions chosen from an older snapshot, which is what stops a click
+  // landing on a re-rendered element. Tracking it here means the model never has to.
+  function recordSnapshot(view, res) {
+    if (!res) return '';
+    if (view) {
+      if (Number.isInteger(res.generation)) view.pageGeneration = res.generation;
+      view.pageElements = parseSnapshot(res.snapshot);
+    }
+    return res.snapshot || '';
+  }
+
+  // Consequential actions used to be refused here. They are now gated properly by
+  // HumanInTheLoopMiddleware on the server, which pauses the graph and asks — see the
+  // `hitl` frame handling. Keeping a second gate here would double-ask, and the refusal
+  // would always win.
+
+  // Flattened into prose because the model reads this as a tool result.
+  function formatActResult(res) {
+    if (!res)       return 'The page did not respond. It may have navigated away.';
+    if (res.error)  return res.error;
+    const lines = (res.results || []).map((r) => `${r.ok ? 'ok' : 'FAILED'}: ${r.detail}`);
+    if (res.remaining) {
+      lines.push(`Stopped after action ${res.stopped_after + 1} because it changes the page; ` +
+                 `${res.remaining} later action(s) were not run. Continue from the snapshot below.`);
+    }
+    return (lines.join('\n') || 'Nothing to do.') + '\n\n' + (res.snapshot || '');
+  }
+
+  function sendToPage(tab, message) {
+    return new Promise((resolve) => {
+      try {
+        chrome.tabs.sendMessage(tab.id, message, (res) => {
+          if (chrome.runtime.lastError) { resolve(null); return; }
+          resolve(res || null);
+        });
+      } catch { resolve(null); }
+    });
+  }
+
+  // Resolves when the tab finishes loading, or on timeout. Event-driven rather than
+  // polling, and scoped to this panel's window like the other tab listeners.
+  function waitForTabLoad(tabId, ms = 15000) {
+    return new Promise((resolve) => {
+      let settled = false;
+      const done = (ok) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        try { chrome.tabs.onUpdated.removeListener(onUpdated); } catch { /* no-op */ }
+        resolve(ok);
+      };
+      const onUpdated = (id, info) => { if (id === tabId && info.status === 'complete') done(true); };
+      const timer = setTimeout(() => done(false), ms);
+      try {
+        chrome.tabs.onUpdated.addListener(onUpdated);
+      } catch {
+        done(false);
+        return;
+      }
+      // It may already be complete — check once, so a load that finished in the gap
+      // between the action and the listener attaching is not waited on forever.
+      Promise.resolve()
+        .then(() => chrome.tabs.get(tabId))
+        .then((t) => { if (t && t.status === 'complete') done(true); })
+        .catch(() => { /* the listener and the timeout still cover it */ });
+    });
+  }
+
+  // The page went away mid-action. Report what we can prove and hand back the new map.
+  // Waits for a tab to settle, then hands back its element map. Shared by the two ways a
+  // page can change under the agent: a click that navigated, and an explicit goto.
+  async function snapshotAfterLoad(tabId, view, headline) {
+    await waitForTabLoad(tabId);
+
+    let tab = { id: tabId };
+    try {
+      const fresh = await chrome.tabs.get(tabId);
+      if (fresh) { tab = fresh; if (view && fresh.url) view.url = fresh.url; }
+    } catch { /* the tab went away; the snapshot attempt below will fail cleanly */ }
+
+    const res = await new Promise((resolve) => getPageSnapshot(tab, resolve));
+    const snapshot = recordSnapshot(view, res);
+    const where = tab.url ? headline.replace('%url%', tab.url) : headline.replace(' %url%', '');
+
+    return snapshot
+      ? `${where}\n\n${snapshot}`
+      : `${where} The page could not be read yet — call read_page to try again.`;
+  }
+
+  // Only ever send the agent somewhere a link could have taken the user. javascript:,
+  // file: and chrome: are all reachable from chrome.tabs and none of them should be.
+  function safeUrl(raw) {
+    let parsed;
+    try { parsed = new URL(String(raw || '').trim()); } catch { return null; }
+    return (parsed.protocol === 'http:' || parsed.protocol === 'https:') ? parsed.href : null;
+  }
+
+  async function runClientTool(tabId, view, name, args) {
+    // Resolved per call rather than captured: after a goto the tab's url has changed, and
+    // a stale tab object would carry the old one into the snapshot.
+    let tab = null;
+    try {
+      tab = await chrome.tabs.get(tabId);
+    } catch {
+      return 'That tab is no longer open.';
+    }
+    if (!tab || tab.id == null) return 'No page is available to act on.';
+
+    if (name === 'read_page') {
+      const res = await new Promise((resolve) => getPageSnapshot(tab, resolve));
+      return recordSnapshot(view, res) ||
+        'No element map available for this page. It may be a browser-internal page.';
+    }
+
+    if (name === 'act') {
+      const actions = Array.isArray(args.actions) ? args.actions : [];
+      if (!actions.length) return 'No actions supplied.';
+
+      const res = await sendToPage(tab, {
+        type: 'SW_ACT',
+        actions: fillSecrets(actions),
+        generation: view?.pageGeneration,
+      });
+
+      // No reply usually means the click started a real page load: the document unloads,
+      // content.js is destroyed, and the response never comes. Wait for the new page and
+      // snapshot that, so the agent gets somewhere to continue instead of an error it has
+      // to guess its way out of.
+      if (!res) {
+        return await snapshotAfterLoad(tab.id, view, 'The action ran and the page is now %url%.');
+      }
+
+      recordSnapshot(view, res);
+      return formatActResult(res);
+    }
+
+    if (name === 'goto') {
+      const url = safeUrl(args.url);
+      if (!url) {
+        return `"${args.url}" is not a web address I can open. Only http and https are allowed.`;
+      }
+
+      try {
+        await chrome.tabs.update(tab.id, { url });
+      } catch (err) {
+        return `Could not navigate: ${err?.message || err}`;
+      }
+      return await snapshotAfterLoad(tab.id, view, 'The page is now %url%.');
+    }
+
+    return `Unknown page tool "${name}".`;
+  }
+
   // ── Main handler ───────────────────────────────────────────────────────────
+
+  // An interrupted turn must not read back to the model as a finished answer — and an empty
+  // assistant message is rejected outright by Anthropic, so it never goes over the wire bare.
+  function historyEntry(m) {
+    const content = m.content || '';
+    if (m.role !== 'assistant' || !m.interrupted) return { role: m.role, content };
+    const partial = content.trim();
+    return {
+      role: 'assistant',
+      content: partial
+        ? `${partial}\n\n[interrupted by the user before this answer was finished]`
+        : '[interrupted by the user before answering]',
+    };
+  }
 
   async function handleQuery(tab, view, query, turn) {
     const key = savedApiKeys[selectedProvider];
     if (!key) { turn.fail('No API key for this provider. Open the ☰ menu → API Keys.'); return; }
 
     getPageText(tab, async (text) => {
+      // Two payloads doing two different jobs: `text` is prose for answering questions,
+      // `snapshot` is the element map for acting. The snapshot also seeds the generation
+      // that content.js checks before it will touch anything.
+      const snapRes  = await new Promise((resolve) => getPageSnapshot(tab, resolve));
+      const snapshot = recordSnapshot(view, snapRes);
+
       const controller = new AbortController();
       view.controller  = controller;
       setStreaming(view, true);
 
-      let response;
-      try {
-        const payload = {
-            query,
-            text:       text || '',
-            model:      selectedModel?.id,
-            history:    view.messages.slice(0, -1),
-            tool_keys:  savedToolKeys,
-          };
-          if (selectedProvider === 'claude' && savedApiKeys.gemini)
-            payload.gemini_key = savedApiKeys.gemini;
-
-          response = await fetch(`${BACKEND}/chat`, {
-          method:  'POST',
-          headers: { 'Content-Type': 'application/json', 'Token': key, 'Provider': selectedProvider },
-          signal:  controller.signal,
-          body: JSON.stringify(payload),
-        });
-      } catch (err) {
+      // A stopped turn stays in the transcript, labelled. Only the panel's own housekeeping
+      // aborts delete it — those fire while the chat is being wiped, so re-adding a bubble
+      // there would resurrect a conversation that was just cleared.
+      const endAborted = () => {
         setStreaming(view, false);
-        if (err.name === 'AbortError') { turn.discard(); return; }
-        turn.fail('Could not reach backend: ' + err.message);
-        return;
-      }
+        if (controller.signal.reason === 'user-stop') {
+          view.messages.push({ role: 'assistant', ...turn.interrupt() });
+          saveChat(view);
+        } else {
+          turn.discard();
+        }
+      };
 
-      if (!response.ok) {
-        setStreaming(view, false);
-        try { const d = await response.json(); turn.fail(d.detail || 'Backend error.'); }
-        catch { turn.fail('Backend error ' + response.status); }
-        return;
-      }
+      const payload = {
+        query,
+        text:      text || '',
+        snapshot:  snapshot || '',
+        mode:      agentMode,
+        model:     selectedModel?.id,
+        history:   view.messages.slice(0, -1).map(historyEntry),
+        tool_keys: savedToolKeys,
+      };
+      if (selectedProvider === 'claude' && savedApiKeys.gemini)
+        payload.gemini_key = savedApiKeys.gemini;
 
       let errored = false;
-
-      await readSSEStream(response, {
+      const handlers = {
         onMeta:       () => {},
         onTool:       (tool) => turn.onTool(tool),
         onToolResult: (res)  => turn.onToolResult(res),
         onText:       (t)    => turn.onText(t),
         onError:      (msg)  => { if (!controller.signal.aborted) { errored = true; turn.fail(msg); } },
-      });
+        onClientTool: (name, args) => runClientTool(tab.id, view, name, args),
+        onHitl:       (request)    => turn.askHuman(request),
+      };
 
-      const aborted = controller.signal.aborted;
+      // The socket first, because it is the only transport that can run page actions: it
+      // lets the server call back mid-run. A backend or proxy without WebSocket support
+      // falls back to POST, which still answers questions — it just cannot act.
+      let done = false;
+      if (wsWorthTrying()) {
+        try {
+          await runWsQuery(
+            { ...payload, token: key, provider: selectedProvider },
+            handlers,
+            controller.signal,
+          );
+          done = true;
+        } catch (err) {
+          if (err?.name === 'AbortError') { endAborted(); return; }
+          if (!(err instanceof TransportUnavailable)) {
+            setStreaming(view, false);
+            turn.fail('Connection lost: ' + (err?.message || err));
+            return;
+          }
+          markWsUnavailable();   // don't re-pay the connect timeout every question
+        }
+      }
+
+      if (!done) {
+        let response;
+        try {
+          response = await fetch(`${BACKEND}/chat`, {
+            method:  'POST',
+            headers: { 'Content-Type': 'application/json', 'Token': key, 'Provider': selectedProvider },
+            signal:  controller.signal,
+            body: JSON.stringify(payload),
+          });
+        } catch (err) {
+          if (err.name === 'AbortError') { endAborted(); return; }
+          setStreaming(view, false);
+          turn.fail('Could not reach backend: ' + err.message);
+          return;
+        }
+
+        if (!response.ok) {
+          setStreaming(view, false);
+          try { const d = await response.json(); turn.fail(d.detail || 'Backend error.'); }
+          catch { turn.fail('Backend error ' + response.status); }
+          return;
+        }
+
+        await readSSEStream(response, handlers);
+      }
+
+      if (errored) { setStreaming(view, false); return; }
+      if (controller.signal.aborted) { endAborted(); return; }
       setStreaming(view, false);
-      if (errored) return;
-
-      if (aborted && !turn.hasAnswer()) { turn.discard(); return; }
 
       const rec = turn.finish();
       if (rec.content.trim() || rec.steps.length) {
@@ -1241,7 +1849,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
   askBtn.addEventListener('click', async () => {
     if (askBtn.classList.contains('stop-mode')) {
-      activeView()?.controller?.abort();   // handleQuery clears streaming state
+      // The reason is what tells handleQuery this was a deliberate stop and not the panel
+      // tidying up after a navigation or a closed tab.
+      activeView()?.controller?.abort('user-stop');   // handleQuery clears streaming state
       return;
     }
 

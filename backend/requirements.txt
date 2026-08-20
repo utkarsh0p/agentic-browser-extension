@@ -1,15 +1,20 @@
 # ── Web server ────────────────────────────────────────────────────────────────
 fastapi
 uvicorn[standard]
+# server.py loads backend/.env itself, so this cannot be left to uvicorn's extras.
+python-dotenv
 
 # ── Vector search ─────────────────────────────────────────────────────────────
 scikit-learn
 
 # ── LangChain + LangGraph ─────────────────────────────────────────────────────
-langchain
-langchain-core
+# Pinned to v1+: server.py uses langchain.agents.create_agent and the middleware in
+# langchain.agents.middleware, neither of which exists in 0.x. Unpinned, a rebuild
+# could silently resolve to a version without them.
+langchain>=1.3,<2
+langchain-core>=1.0,<2
 langchain-text-splitters
-langgraph
+langgraph>=1.0,<2
 
 # ── Provider: OpenAI ──────────────────────────────────────────────────────────
 langchain-openai
@@ -21,5 +26,4 @@ langchain-google-genai
 langchain-anthropic
 
 # ── External tools ────────────────────────────────────────────────────────────
-tavily-python
 composio-langchain
