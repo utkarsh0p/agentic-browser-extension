@@ -21,12 +21,26 @@
   const MAX_OPTIONS    = 20;
 
   const state = {
-    // index → { el, role, name }. The [n] in the snapshot indexes this. The role and name
-    // are kept so an action can prove the element is still the one the model was shown:
-    // a bare element reference happily survives a re-render into a different button.
+    // [{ id, el, role, name }] in document order. The number in the snapshot is a HANDLE,
+    // not a position: it is assigned to an element the first time that element is listed
+    // and stays with it for as long as it is on the page.
+    //
+    // This used to be the array index, which meant one row arriving at the top renumbered
+    // everything below it — so a handle the model was still holding silently pointed at a
+    // different element. That single property is what forced the batch-wide staleness
+    // vetoes, blinded the repeated-call guard (the same target had different args every
+    // time), and made map diffing impossible.
     elements: [],
-    generation: 0,  // bumped every snapshot; acting on an older one must error
-    url: '',        // location at snapshot time; a navigation invalidates every id
+    handles: new WeakMap(),   // element → its handle, assigned once
+    byId: new Map(),          // handle → WeakRef(element), for resolve()
+    nextId: 1,
+    generation: 0,  // bumped every snapshot; reported to the model as context, not a veto
+    url: '',        // location at snapshot time
+    scoped: false,  // true when the map covers only an open dialog, not the page
+    // Last serialized map. Compared, not assumed: a "nothing changed" decision taken from
+    // the verb would be wrong, because type fires input events that open autocomplete
+    // lists and hover opens menus — both change the map.
+    lastMap: '',
   };
   window.__siteWhisper = state;
 
@@ -47,11 +61,30 @@
     'tab', 'switch', 'slider', 'spinbutton', 'treeitem',
   ]);
 
+  // Roles that describe a wrapper around other controls. Listing one of these would
+  // duplicate its children and hand the model a line whose name is every child's text
+  // joined together.
+  const CONTAINER_ROLES = new Set([
+    'grid', 'table', 'rowgroup', 'columnheader', 'rowheader',
+    'list', 'listbox', 'menu', 'menubar', 'tablist', 'toolbar', 'tree', 'treegrid',
+    'navigation', 'main', 'region', 'banner', 'contentinfo', 'complementary',
+    'form', 'search', 'group', 'radiogroup', 'presentation', 'none', 'generic',
+    'document', 'application', 'article', 'dialog', 'alertdialog',
+  ]);
+
   function isInteractive(el) {
     const role = (el.getAttribute('role') || '').trim().toLowerCase();
-    if (role) return ACTIONABLE_ROLES.has(role);
+    if (role && ACTIONABLE_ROLES.has(role)) return true;
     if (el.matches(NATIVE_SEL)) return true;
-    // Click handlers and focusable divs are only worth a line if they're named —
+    // A role outside the whitelist used to return false right here, which quietly made a
+    // whole class of control unreachable: an app that builds its rows as role="row" — a
+    // mail list, a table of records — has clickable, focusable, named rows that never
+    // appeared in the map at all. The agent could see their checkboxes (all sharing one
+    // accessible name) but never the rows themselves, so "the first mail" had nothing to
+    // point at. Containers still stay out; everything else falls through to the same
+    // clickable-and-named test as an unroled div.
+    if (role && CONTAINER_ROLES.has(role)) return false;
+    // Click handlers and focusable elements are only worth a line if they're named —
     // otherwise they are layout noise that would crowd out the real controls.
     if (el.hasAttribute('onclick') || el.tabIndex >= 0) return !!accessibleName(el);
     return false;
@@ -220,14 +253,72 @@
     }
   }
 
-  function describe(entry, index) {
-    const { el, role, name } = entry;
+  // ── The active modal, if there is one ───────────────────────────────────────
+  // When a dialog is open it is the ONLY thing the user can touch: focus is trapped and
+  // everything behind it is unclickable. Snapshotting the whole document then is both
+  // wrong and expensive — on a feed page the background fills MAX_ELEMENTS and pushes the
+  // dialog, which is usually a portal at the end of <body>, out of the map entirely. That
+  // is exactly how "I clicked Start a post but there is no text field" happens.
+  //
+  // Ordered most to least trustworthy. :modal covers showModal(), whose inertness is
+  // spec-level and carries no attribute for [inert] to match.
+  const MODAL_SEL = [
+    'dialog[open]',
+    '[role="dialog"][aria-modal="true"]',
+    '[role="alertdialog"][aria-modal="true"]',
+    '[aria-modal="true"]',
+  ];
+
+  function activeModal() {
+    try {
+      const native = document.querySelectorAll('dialog[open]');
+      for (let i = native.length - 1; i >= 0; i--) {
+        // :modal is the real test — a non-modal <dialog open> does not trap anything.
+        try { if (native[i].matches(':modal')) return native[i]; } catch { /* older engine */ }
+      }
+    } catch { /* no matter, the selectors below still apply */ }
+
+    for (const sel of MODAL_SEL) {
+      let found;
+      try { found = document.querySelectorAll(sel); } catch { continue; }
+      // Last match wins: stacked dialogs put the topmost one last in the DOM.
+      for (let i = found.length - 1; i >= 0; i--) {
+        if (isVisible(found[i])) return found[i];
+      }
+    }
+
+    // Nothing declared itself. Fall back to the overlay that currently holds focus, which
+    // catches the many dialogs built from a plain positioned div with a focus trap.
+    const active = document.activeElement;
+    if (active && active !== document.body && active !== document.documentElement) {
+      for (let el = active; el && el !== document.body; el = el.parentElement) {
+        let pos;
+        try { pos = getComputedStyle(el).position; } catch { break; }
+        if (pos !== 'fixed' && pos !== 'absolute') continue;
+        const r = el.getBoundingClientRect();
+        // Big enough to be a panel rather than a tooltip or a sticky header.
+        if (r.width >= 240 && r.height >= 160) return el;
+      }
+    }
+    return null;
+  }
+
+  // The map's delimiters are " = " before a value and "[...]" around flags, so a name or
+  // value containing either would make a line ambiguous to parse. Names are accessible
+  // text, so this practically never fires — but a page that does it must not be able to
+  // corrupt the approval prompt's idea of which element it is describing.
+  function clean(s) {
+    return String(s).replace(/[[\]]/g, '').replace(/\s=\s/g, ' ').trim();
+  }
+
+  function describe(entry) {
+    const { el, id, role, name } = entry;
     const flags = stateFlags(el, role);
     const value = valueOf(el, role);
 
-    let line = `[${index}] ${role}`;
-    if (name) line += ` "${name}"`;
-    if (value !== null && value !== undefined) line += ` = "${value}"`;
+    let line = `${id} ${role}`;
+    if (name) line += ` ${clean(name)}`;
+    if (value !== null && value !== undefined) line += ` = ${clean(value)}`;
     if (flags.length) line += ` [${flags.join(' ')}]`;
 
     // Without the options listed, the model has to guess what to pass to select().
@@ -244,11 +335,34 @@
 
   function buildSnapshot() {
     const found = [];
-    collect(document, found);
+    const modal = activeModal();
+    // Scope to the dialog when one is open, so the map describes what is actually
+    // reachable. Its own controls come first because collect() starts at the root.
+    collect(modal || document, found);
+    // A dialog with nothing in it is not worth locking the map down to.
+    if (modal && !found.length) collect(document, found);
 
-    state.elements = found.map((el) => ({ el, role: roleOf(el), name: accessibleName(el) }));
+    state.elements = found.map((el) => {
+      let id = state.handles.get(el);
+      if (id === undefined) {
+        id = state.nextId++;
+        state.handles.set(el, id);
+      }
+      const role = roleOf(el);
+      const name = accessibleName(el);
+      state.byId.set(id, { ref: new WeakRef(el), role, name });
+      return { id, el, role, name };
+    });
+
+    // byId holds weak references so a removed element can be collected; drop the handles
+    // whose element already has been, or the map grows for the life of the page.
+    for (const [id, known] of state.byId) {
+      if (known.ref.deref() === undefined) state.byId.delete(id);
+    }
+
     state.generation += 1;
     state.url = location.href;
+    state.scoped = !!(modal && found.length);
 
     const lines = state.elements.map(describe);
     const header = [
@@ -256,12 +370,33 @@
       `url: ${location.href}`,
       `generation: ${state.generation}`,
     ];
+    if (state.scoped) {
+      const name = accessibleName(modal);
+      header.push(`scope: the open dialog${name ? ` "${name}"` : ''} — ` +
+                  'the rest of the page is behind it and cannot be clicked. ' +
+                  'Close the dialog to reach the page again.');
+    }
     if (!lines.length) {
       header.push('(no interactive elements found — the page may still be loading, ' +
                   'or its controls may be drawn on a canvas)');
     } else if (found.length >= MAX_ELEMENTS) {
-      header.push(`(truncated at ${MAX_ELEMENTS} elements — scroll or narrow the page to see more)`);
+      // NOT "scroll to see more": collection is document order, not viewport order, so
+      // scrolling returns the same first MAX_ELEMENTS every time.
+      header.push(`(only the first ${MAX_ELEMENTS} elements are listed — a control can be ` +
+                  'on the page and missing from this list. Open the menu or dialog that ' +
+                  'holds it, or act on what has focus)');
     }
+
+    const snapshot = header.join('\n') + (lines.length ? '\n\n' + lines.join('\n') : '');
+
+    // Compared against the previous map on the element lines alone: the header carries the
+    // generation counter, which changes every time by design. Only the caller that appends
+    // a map as a bonus (an act result) may act on this — an explicit read_page must always
+    // return the real thing, because re-reading is how the agent recovers a map that was
+    // dropped from its context.
+    const body = lines.join('\n');
+    const unchanged = !!state.lastMap && body === state.lastMap;
+    state.lastMap = body;
 
     return {
       ok: true,
@@ -270,7 +405,9 @@
       title: document.title || '',
       count: found.length,
       truncated: found.length >= MAX_ELEMENTS,
-      snapshot: header.join('\n') + (lines.length ? '\n\n' + lines.join('\n') : ''),
+      scoped: state.scoped,
+      unchanged,
+      snapshot,
     };
   }
 
@@ -279,7 +416,7 @@
   // Verbs that are expected to change the page. The batch stops after one so the next
   // decision is made against a fresh snapshot: ids shift on re-render, and a custom
   // dropdown's options do not exist in the DOM until the trigger has been clicked.
-  const TERMINAL_VERBS = new Set(['click', 'submit', 'press']);
+  const TERMINAL_VERBS = new Set(['click', 'submit', 'press', 'back', 'forward']);
 
   const SETTLE_QUIET_MS = 400;   // no mutations for this long counts as settled
   const SETTLE_MAX_MS   = 3000;  // an animating page never goes quiet; cap the wait
@@ -287,29 +424,49 @@
   class ActionError extends Error {}
 
   // ── Resolving an id back to a live element ──────────────────────────────────
+  // Handles are resolved against the element they were minted for, so a number the model
+  // is still holding either finds that same element or fails saying so. It can never find
+  // a different one, which is what the old positional lookup did silently.
   function resolve(id) {
-    if (!Number.isInteger(id) || id < 0 || id >= state.elements.length) {
+    if (!Number.isInteger(id)) {
+      throw new ActionError(`"${id}" is not an element number. Read the page and use one of its numbers.`);
+    }
+
+    const known = state.byId.get(id);
+    const el = known?.ref.deref();
+    if (!el) {
       throw new ActionError(
-        `No element [${id}] in the current snapshot (it has ${state.elements.length}). ` +
-        'Call read_page again.'
+        `Element ${id} is not on this page. It may have been removed, or the number may be ` +
+        'from a different page. Read the page again for current numbers.'
       );
     }
-    const entry = state.elements[id];
-    if (!entry.el.isConnected) {
+    if (!el.isConnected) {
+      throw new ActionError(`Element ${id} has been removed from the page. Read the page again.`);
+    }
+
+    // Element identity is not the same as element purpose: a re-render can reuse a node for
+    // something else, and clicking that would be worse than failing. Checked against what
+    // the element was when it was last listed, which is recorded even for elements that did
+    // not make it into the most recent map.
+    const name = accessibleName(el);
+    if (name !== known.name) {
       throw new ActionError(
-        `Element [${id}] ("${entry.name}") is no longer on the page. Call read_page again.`
+        `Element ${id} is now "${name}" but was "${known.name}" when you last read the page. ` +
+        'It changed underneath — read the page again.'
       );
     }
-    // The strongest staleness check available: a re-render can hand the same DOM node a
-    // different purpose, and clicking it would be worse than failing.
-    const nameNow = accessibleName(entry.el);
-    if (nameNow !== entry.name) {
+
+    // Checked here as well as at collection time. Nothing else now stops an action landing
+    // on a control that a dialog has since covered: it is still in the DOM, still has its
+    // name, and a user could not touch it.
+    if (!isVisible(el)) {
       throw new ActionError(
-        `Element [${id}] is now "${nameNow}" but the snapshot showed "${entry.name}". ` +
-        'The page changed — call read_page again.'
+        `Element ${id} ("${name}") is on the page but not reachable — it is hidden, or ` +
+        'something like a dialog is covering it. Read the page again to see what is on top.'
       );
     }
-    return entry;
+
+    return { id, el, role: known.role, name: known.name };
   }
 
   // ── Event helpers ───────────────────────────────────────────────────────────
@@ -494,6 +651,23 @@
     },
 
     wait() { return 'waited for the page to settle'; },
+
+    // Browser history, so a multi-page task can return to a list it came from. Doing this
+    // by re-navigating to a remembered URL does not work on app-style sites, where the
+    // results view often has no address that can be typed back in.
+    //
+    // A real back navigation destroys this content script, so SW_ACT never answers — which
+    // is already handled: runClientTool treats a missing reply as a navigation and waits
+    // for the new page before snapshotting it.
+    back() {
+      history.back();
+      return 'went back';
+    },
+
+    forward() {
+      history.forward();
+      return 'went forward';
+    },
   };
 
   // Finds the thing that actually scrolls: a modal body or chat log scrolls itself while
@@ -509,25 +683,40 @@
   // ── Settle ──────────────────────────────────────────────────────────────────
   // Snapshotting mid-render returns half a DOM, so wait for mutations to stop before
   // looking again.
-  function settle() {
-    return new Promise((done) => {
-      if (typeof MutationObserver !== 'function') { setTimeout(done, SETTLE_QUIET_MS); return; }
-      let quiet, finished = false;
-      const finish = () => {
-        if (finished) return;
-        finished = true;
-        clearTimeout(quiet); clearTimeout(cap); obs.disconnect(); done();
-      };
-      const obs = new MutationObserver(() => {
-        clearTimeout(quiet);
-        quiet = setTimeout(finish, SETTLE_QUIET_MS);
-      });
-      obs.observe(document.documentElement || document, {
-        childList: true, subtree: true, attributes: true, characterData: true,
-      });
-      quiet = setTimeout(finish, SETTLE_QUIET_MS);
-      const cap = setTimeout(finish, SETTLE_MAX_MS);
+  // Watch from BEFORE the action runs. Attaching the observer afterwards misses every
+  // mutation the click flushed synchronously — a framework inserting a modal in the same
+  // task — so "I saw nothing" was indistinguishable from "nothing happened", and the
+  // 400ms quiet timer fired on a page that was in fact mid-render.
+  function watch() {
+    if (typeof MutationObserver !== 'function') {
+      return { settle: () => new Promise((r) => setTimeout(() => r('blind'), SETTLE_QUIET_MS)) };
+    }
+    let seen = 0;
+    const obs = new MutationObserver((records) => { seen += records.length; bump(); });
+    let bump = () => {};
+    obs.observe(document.documentElement || document, {
+      childList: true, subtree: true, attributes: true, characterData: true,
     });
+
+    return {
+      settle() {
+        return new Promise((done) => {
+          let quiet, finished = false;
+          const finish = (why) => {
+            if (finished) return;
+            finished = true;
+            clearTimeout(quiet); clearTimeout(cap); obs.disconnect();
+            done(why);
+          };
+          bump = () => { clearTimeout(quiet); quiet = setTimeout(() => finish('quiet'), SETTLE_QUIET_MS); };
+          // Nothing has changed yet. Give the page a beat to start before believing it:
+          // an async render (a lazily loaded dialog) has not even begun at this point.
+          quiet = setTimeout(() => finish(seen ? 'quiet' : 'still'), SETTLE_QUIET_MS);
+          const cap = setTimeout(() => finish('busy'), SETTLE_MAX_MS);
+        });
+      },
+      get seen() { return seen; },
+    };
   }
 
   // ── Running a batch ─────────────────────────────────────────────────────────
@@ -535,21 +724,26 @@
     const actions = Array.isArray(message.actions) ? message.actions : [];
     if (!actions.length) return { ok: false, error: 'No actions supplied.' };
 
-    // Acting on an older snapshot than the one that produced these ids is exactly how a
-    // click lands on the wrong element.
+    // Neither of these refuses the batch any more. They used to have to: with positional
+    // ids a stale number pointed at a different element, so the only safe answer was to
+    // reject everything and demand a re-read. Handles carry identity now, so resolve()
+    // catches a dead number precisely, per action — and a hash-routed app that re-renders
+    // between every step (Gmail) no longer loses a whole round trip to a veto for elements
+    // that are still perfectly valid.
+    const drift = [];
     if (Number.isInteger(message.generation) && message.generation !== state.generation) {
-      return {
-        ok: false,
-        error: `These actions were chosen from snapshot ${message.generation}, but the page ` +
-               `is now at ${state.generation}. Call read_page again.`,
-      };
+      drift.push(`the page has been read again since you chose these (map ${message.generation} → ${state.generation})`);
     }
     if (state.url && state.url !== location.href) {
-      return {
-        ok: false,
-        error: `The page navigated to ${location.href} since the snapshot. Call read_page again.`,
-      };
+      drift.push(`the view moved to ${location.href}`);
     }
+
+    // What the map looked like going in, so the reply can say what the action actually
+    // did. Without this the model's only evidence is a fresh snapshot, and a click that
+    // opened a dialog it could not see reads exactly like a click that did nothing.
+    const before = new Set(state.elements.map((e) => `${e.role}|${e.name}`));
+    const wasScoped = state.scoped;
+    const watcher = watch();
 
     const results = [];
     let stoppedAfter = null;
@@ -568,7 +762,7 @@
       let entry = null;
       try {
         if (Number.isInteger(action.id)) entry = resolve(action.id);
-        else if (!['press', 'scroll', 'submit', 'wait'].includes(verb)) {
+        else if (!['press', 'scroll', 'submit', 'wait', 'back', 'forward'].includes(verb)) {
           throw new ActionError(`${verb} requires an element id from read_page.`);
         }
         results.push({ verb, id: action.id, ok: true, detail: run(action, entry) });
@@ -584,12 +778,42 @@
       if (TERMINAL_VERBS.has(verb)) break;
     }
 
-    await settle();
+    const why = await watcher.settle();
     const fresh = buildSnapshot();
+
+    const after = state.elements.map((e) => `${e.role}|${e.name}`);
+    const appeared = after.filter((k) => !before.has(k));
+    const gone = before.size - (after.length - appeared.length);
+
+    let changed;
+    if (fresh.scoped && !wasScoped) {
+      changed = `a dialog opened — the map below is its contents (${after.length} controls)`;
+    } else if (wasScoped && !fresh.scoped) {
+      changed = 'the dialog closed — the map below is the page again';
+    } else if (appeared.length || gone > 0) {
+      const bits = [];
+      if (appeared.length) bits.push(`${appeared.length} new`);
+      if (gone > 0) bits.push(`${gone} gone`);
+      changed = `the page changed (${bits.join(', ')})`;
+    } else if (why === 'busy') {
+      changed = 'the page is still changing and did not settle — it may not be finished yet';
+    } else if (why === 'still') {
+      changed = 'nothing happened at all — the page never even started to change. If you ' +
+                'expected something to open, it did not. Read the page again, or try a ' +
+                'different element.';
+    } else {
+      changed = 'nothing visible changed. The control you want may be present but not ' +
+                'listed below — try act with {"verb":"wait"}, or act on what has focus.';
+    }
 
     return {
       ok: results.every((r) => r.ok),
       results,
+      changed,
+      // Context, not a complaint: it explains a failed action without implying the whole
+      // batch was wrong to attempt.
+      drift: drift.length ? drift.join('; ') : null,
+      settled: why,
       stopped_after: stoppedAfter,
       remaining: stoppedAfter === null ? 0 : actions.length - stoppedAfter - 1,
       generation: fresh.generation,

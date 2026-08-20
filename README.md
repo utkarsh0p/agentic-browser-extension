@@ -6,7 +6,6 @@ A Chrome extension powered by a **LangGraph ReAct agent** that lives in your bro
 
 ## What It Does
 
-- **Chat with any webpage** — AI reads the page, finds relevant sections using RAG, and answers your questions
 - **Summarize pages** — get a full summary of any article or page in one click
 - **Connect to 500+ apps** — via Composio meta tools, the agent can search for tools, connect to services (Gmail, Google Docs, Slack, etc.), and execute actions on your behalf
 - **General AI chat** — works as a regular AI assistant when no page context is needed
@@ -19,25 +18,19 @@ A Chrome extension powered by a **LangGraph ReAct agent** that lives in your bro
 User types question
         │
         ▼
-   popup.js (side panel UI — one chat per tab)
-        │
-        ├── chrome.scripting.executeScript → active tab
-        │       └── Scrapes page text (raw innerText)
+   popup.js (side panel UI — one chat per window)
         │
         ├── chrome.tabs.sendMessage → content.js
-        │       ├── SW_SNAPSHOT → numbered element map: [15] button "Sign in"
+        │       ├── SW_SNAPSHOT → numbered element map: 15 button Sign in
         │       └── SW_ACT      → click / type / check / select / press / scroll …
         │
         └── WebSocket /chat/ws  → FastAPI backend   (POST /chat as fallback)
                 │
-                ├── RecursiveCharacterTextSplitter (500 chars, 50 overlap)
-                │
                 ├── create_agent (ReAct loop) decides which tools to use:
-                │     ├── search_page     → embed chunks, cosine similarity, top 3
-                │     ├── summarize_page  → return full page text to LLM
-                │     ├── read_page       → interactive elements + their state   ┐ run in
-                │     ├── act             → perform actions on the page          │ the
-                │     ├── ask_user        → pause and ask the user for input     │ browser
+                │     ├── read_text       → the page's visible text              ┐ run in
+                │     ├── read_page       → interactive elements + their state   │ the
+                │     ├── act             → perform actions on the page          │ browser
+                │     ├── ask_user        → pause and ask the user for input     │
                 │     ├── goto            → send the tab to a new address       ┘
                 │     └── Composio tools  → dynamic tool discovery + execution
                 │
@@ -53,37 +46,24 @@ User types question
 
 **Frontend (Chrome Extension — Manifest V3)**
 - Plain JavaScript, HTML, CSS — no build step
-- `popup.js` — side panel UI: per-tab chats, provider/model selection, SSE streaming, persistence
-- `background.js` — routes the toolbar click to the side panel, prunes chats for closed tabs
+- `popup.js` — side panel UI: the conversation, provider/model selection, SSE streaming, persistence
+- `background.js` — routes the toolbar click to the side panel, prunes chats for closed windows
 - `content.js` — page agent: builds the numbered accessibility snapshot the model uses to
   address elements, and executes the action verbs. Element references stay in the page;
   only `[15] button "Sign in"` is sent, and only `click(15)` comes back
 
 **Backend (FastAPI + LangGraph)**
 - FastAPI with SSE streaming responses
-- LangGraph `create_react_agent` — ReAct agent with tool use
-- LangChain for LLM abstraction and text splitting
-- Scikit-learn for TF-IDF + cosine similarity (Claude fallback)
-- Vector embeddings via OpenAI / Gemini APIs
+- LangChain v1 `create_agent` — tool-calling agent with middleware
 - Composio for dynamic app integrations
 
 **AI Providers**
-| Provider | LLM | Embeddings |
-|---|---|---|
-| Claude (Anthropic) | Haiku 4.5 / Sonnet 4.6 / Opus 4.6 | Gemini fallback or TF-IDF |
-| Gemini (Google) | 2.5 Flash / 2.5 Pro / 2.0 Flash | gemini-embedding-001 |
-| GPT (OpenAI) | GPT-4.1 mini / GPT-4.1 / o4-mini | text-embedding-3-small |
-
----
-
-## How RAG Works
-
-1. `popup.js` reads `document.body.innerText` via `chrome.scripting.executeScript` and sends the raw text to the backend
-2. Backend uses `RecursiveCharacterTextSplitter` (500 chars, 50 overlap) — splits on paragraphs, sentences, then words
-3. The agent decides whether to call `search_page` based on the user's question
-4. `search_page` embeds all chunks + query using the provider's embedding model (or TF-IDF for Claude)
-5. Cosine similarity selects the **top 3 most relevant chunks**
-6. Agent uses those chunks to generate a grounded answer
+| Provider | LLM |
+|---|---|
+| Claude (Anthropic) | Haiku 4.5 / Sonnet 4.6 / Opus 4.6 |
+| Gemini (Google) | 2.5 Flash / 2.5 Pro / 2.0 Flash |
+| GPT (OpenAI) | GPT-4.1 mini / GPT-4.1 / o4-mini |
+| Groq (GroqCloud) | GPT-OSS 120B / GPT-OSS 20B / Qwen3.6 27B |
 
 ---
 
@@ -91,11 +71,14 @@ User types question
 
 1. `content.js` walks the page's interactive elements and emits a numbered snapshot —
    essentially the accessibility tree, so it works on any site with no per-domain rules.
-   Each line carries **state**, not just identity: `[16] checkbox "Terms" [unchecked]`
+   Each line carries **state**, not just identity: `16 checkbox Terms [unchecked]`.
+   Ids and names are unquoted on purpose — brackets and quotes were 71% of every line's
+   tokens, and dropping them halves the map (1,820 → 967 on a 200-element page)
 2. Only that text goes to the model. Element references never leave the page, so the model
    addresses things by number and the panel resolves them locally
 3. `act` runs a batch of verbs in one round trip — the main cost lever, since a 10-field
-   form becomes ~2 model calls instead of ~10
+   form becomes ~2 model calls instead of ~10. Verbs: `click type clear check uncheck
+   select press hover scroll submit wait back forward`
 4. A batch **stops after the first `click`, `press` or `submit`**, because those change the
    page and every later id may be stale. Fills are grouped; the click goes last
 5. Afterwards a `MutationObserver` waits for the DOM to go quiet (~400ms, capped at 3s),
@@ -107,10 +90,25 @@ frame goes down, a `client_tool_result` comes back, and one uninterrupted agent 
 the whole task — no transcript replay and no checkpointer. On `POST /chat` the action tools
 are simply not offered.
 
+**Element numbers are handles, not positions.** A number is assigned to an element the
+first time it is listed and stays with it for as long as it is on the page, so a number the
+model is still holding keeps meaning the same control even after the page rearranges around
+it. Line order carries position; the number carries identity.
+
+This matters more than it sounds. When numbers were array indices, one row arriving at the
+top renumbered everything below it, so a number the model still held silently pointed at a
+*different* element. That single property forced batch-wide staleness vetoes (the only safe
+answer to a stale index is to refuse everything), blinded the repeated-call guard (the same
+target had different arguments every time), and made map diffing impossible. On a
+hash-routed app like Gmail — where the view changes without a page load — it produced turns
+that alternated `act → read_page → act → read_page` and never finished.
+
 **Safety.** `check`/`uncheck` read current state and no-op when already correct, so
-"accept the terms" cannot un-accept a pre-checked box. Element ids are verified before use:
-a removed element, a renamed one, or a navigation since the snapshot is refused rather than
-clicked. Passwords are never sent to the model — the snapshot reports a length.
+"accept the terms" cannot un-accept a pre-checked box. Every action re-verifies its target
+before touching it: the number must still resolve to the same element, that element must
+still carry the name it was listed under (a re-render can reuse a node for something else),
+and it must still be reachable — an element a dialog has since covered is refused rather
+than clicked. Passwords are never sent to the model — the snapshot reports a length.
 
 ---
 
@@ -162,15 +160,60 @@ resumes rather than ending the turn and starting a new one.
 
 ---
 
+## Lanes
+
+Every turn is routed once, before any tools are loaded, and then handled by a lane that
+holds only what that lane needs. One structured-output call reads the lane descriptions —
+never the tool schemas — so routing costs ~190 tokens and happens once per turn, not once
+per model call.
+
+| Lane | Tools | Preamble |
+|---|---|---|
+| `chat` | `escalate` only | ~250 tokens |
+| `ask_page` | `search_page`, `summarize_page`, `read_page` | ~675 |
+| `operate` | `read_page`, `read_text`, `act`, `goto`, `ask_user`, `summarize_page` | ~1,900 |
+| `app` | Composio tools, `summarize_page` | varies |
+
+Why it matters beyond cost: a conversational message cannot trip an approval prompt or a
+page action, because the lane that handles it has no such tool to call. Misrouting is
+recoverable — every lane except `operate` carries `escalate`, which hands the turn to the
+page tools once, and the transport enforces the single hop by building the second pass
+without an `escalate` tool at all.
+
+`CAPABILITIES` in `server.py` is the single source: one entry per tool declares which lanes
+may offer it and what prompt guidance joins the prompt when it does. Adding a tool means
+adding one entry — the router's options and each lane's prompt follow from it. Anything not
+declared (Composio ships its tools at runtime) lands in the `app` lane by default.
+
+Prompt fragment **order** is fixed by `PROMPT_SEQUENCE` rather than by registry order: it
+reproduces the sequence of the prompt that was tuned by use, and the acting rules close the
+prompt.
+
+---
+
 ## Agent Tools
 
 | Tool | What it does | When the agent uses it |
 |---|---|---|
-| `search_page` | Embeds page chunks, finds top 3 by cosine similarity | Any question about what the page says |
-| `summarize_page` | Returns full page text (up to 15k chars) | Only an explicit summary or full-contents request |
+| `read_text` | Page's visible text, read live when the tool runs | Any question about what a page says |
+| `search_page` | Chunks the page and returns the passages matching a query | A question about the page — the `ask_page` lane's main tool |
+| `summarize_page` | The whole page's text, capped | "Summarise this", "what is this about" |
+| `escalate` | Hands the turn to the page tools | A non-`operate` lane finds it needs to click or type |
 | Composio meta tools | Search, connect, and execute 500+ app integrations | User asks to send email, create docs, etc. |
 
-The agent **decides** which tools to use — it's not a fixed pipeline. Simple questions get direct answers, page questions trigger `search_page`, and complex tasks chain multiple tools.
+`search_page` ranks chunks by TF-IDF cosine similarity, and by provider embeddings when the
+selected provider has them (OpenAI, Gemini). TF-IDF is the default rather than a fallback:
+**Groq exposes no embeddings endpoint**, so it is the only retrieval that works there — and
+it costs no tokens and no extra call. A page question returns ~600 tokens of passages
+instead of a 5,000-token text dump.
+
+Within a lane the agent still **decides** which of its tools to use — it is not a fixed
+pipeline.
+
+**Web lookups have no dedicated tool.** The browser *is* the internet access: the agent puts the
+query straight into a search address (`https://duckduckgo.com/?q=…`) and navigates there. A results
+page already lists its results as links in the element map, so it can pick one, open it, and
+`read_text` that.
 
 ---
 
@@ -185,7 +228,7 @@ chrome-rag-extension/
 ├── popup/                 # The side panel document (path kept from the popup era)
 │   ├── popup.html         # Chat UI shell
 │   ├── popup.css          # Styles
-│   └── popup.js           # Per-tab chats, streaming, provider/model selection, key setup
+│   └── popup.js           # The conversation, streaming, provider/model selection, key setup
 │
 ├── icons/
 │   ├── logo.svg           # Source logo
@@ -238,7 +281,7 @@ so flipping it needs a restart.
 2. Enable Developer mode
 3. Click **Load unpacked** → select the repo root
 4. Click the extension icon to toggle the side panel. With no keys saved it opens
-   straight into the setup screen — add a key from Anthropic, Google, or OpenAI and
+   straight into the setup screen — add a key from Anthropic, Google, OpenAI, or Groq and
    the chat unlocks. Later, reach it again via ☰ → **API Keys**.
 
 Requires Chrome/Edge/Brave 114+ for the Side Panel API.
@@ -257,11 +300,11 @@ All data stored in `chrome.storage.local`:
 
 | Key | Purpose |
 |---|---|
-| `apiKeys` | `{ claude, gemini, openai }` — LLM provider keys |
+| `apiKeys` | `{ claude, gemini, openai, groq }` — LLM provider keys |
 | `toolKeys` | `{ composio }` — external tool keys |
 | `selectedProvider` | Last used provider |
 | `selectedModelId` | Last used model |
-| `chatMessages` | Persisted chat history |
+| `panelChat:<windowId>` | Persisted conversation, one key per window |
 | `chatPageUrl` | URL of the page the chat belongs to |
 
 ---
@@ -270,7 +313,7 @@ All data stored in `chrome.storage.local`:
 
 - **ReAct agent over fixed pipeline** — the LLM decides which tools to call, enabling flexible multi-step reasoning
 - **Chunking on the backend** — `RecursiveCharacterTextSplitter` with sentence-aware splitting and overlap, instead of blind 500-char cuts on the frontend
-- **Gemini embedding fallback for Claude** — Anthropic has no embeddings API, so if the user has a Gemini key, it's used for embeddings; otherwise falls back to TF-IDF
 - **Conditional tool loading** — Composio tools are only added to the agent when the user has provided that API key
 - **SSE streaming with tool status** — streams both tool call names (for UI status updates) and text tokens for real-time display
-- **Chat persistence with page awareness** — chat history is saved to storage and auto-cleared when the user navigates to a different page
+- **Chat unbound from tabs and pages** — a side panel is one persistent document per window, so the conversation is too. Navigating, switching tabs, and opening or closing tabs all leave it alone; only New Chat clears it. Storage uses one key per window (`panelChat:<windowId>`) rather than a nested object, because `storage.local.set` writes whole values and two panels sharing one object would overwrite each other
+- **Capped history** — the panel shows every message, but only the last 20 go upstream, so a long session does not grow the prompt without bound

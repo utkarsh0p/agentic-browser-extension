@@ -73,6 +73,8 @@ const OPENAI_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="13" height="
 
 const GEMINI_ICON = `<svg width="13" height="13" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="g1" x1="0%" x2="68.73%" y1="100%" y2="30.395%"><stop offset="0%" stop-color="#1C7DFF"/><stop offset="52%" stop-color="#1C69FF"/><stop offset="100%" stop-color="#F0DCD6"/></linearGradient></defs><path d="M12 24A14.304 14.304 0 000 12 14.304 14.304 0 0012 0a14.305 14.305 0 0012 12 14.305 14.305 0 00-12 12" fill="url(#g1)"/></svg>`;
 
+const GROQ_ICON = `<svg width="13" height="13" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><rect width="24" height="24" rx="6" fill="#f55036"/><text x="12" y="17" font-family="-apple-system, Helvetica, Arial, sans-serif" font-size="14" font-weight="600" fill="#ffffff" text-anchor="middle">G</text></svg>`;
+
 const CLAUDE_ICON = `<svg fill="#c96442" fill-rule="evenodd" width="13" height="13" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M13.827 3.52h3.603L24 20h-3.603l-6.57-16.48zm-7.258 0h3.767L16.906 20h-3.674l-1.343-3.461H5.017l-1.344 3.46H0L6.57 3.522zm4.132 9.959L8.453 7.687 6.205 13.48H10.7z"/></svg>`;
 
 // ── Provider & model metadata ──────────────────────────────────────────────────
@@ -81,6 +83,7 @@ const PROVIDERS = {
   claude: { label: 'Claude', sub: 'Anthropic', icon: CLAUDE_ICON, accent: '#c96442' },
   gemini: { label: 'Gemini', sub: 'Google',    icon: GEMINI_ICON, accent: '#1c69ff' },
   openai: { label: 'GPT',    sub: 'OpenAI',    icon: OPENAI_ICON, accent: '#10a37f' },
+  groq:   { label: 'Groq',   sub: 'GroqCloud', icon: GROQ_ICON,   accent: '#f55036' },
 };
 
 // ── Small pure helpers (reasoning trace + card chrome) ──────────────────────────
@@ -93,8 +96,10 @@ function formatTime(ts) {
 
 // Whisper-voice labels for the reasoning rail
 const TOOL_DISPLAY = {
-  search_page:                        'Searching the page',
-  summarize_page:                     'Summarizing the page',
+  read_text:                          'Reading the page',
+  read_page:                          'Looking at the controls',
+  act:                                'Acting on the page',
+  goto:                               'Opening a page',
   COMPOSIO_SEARCH_TOOLS:              'Finding tools',
   COMPOSIO_CHECK_ACTIVE_CONNECTIONS:  'Checking connections',
   COMPOSIO_INITIATE_CONNECTION:       'Connecting',
@@ -157,7 +162,16 @@ function railLabel(name, args) {
   return prettify(name);
 }
 
-const PROVIDER_ORDER = ['claude', 'gemini', 'openai'];
+const PROVIDER_ORDER = ['claude', 'gemini', 'openai', 'groq'];
+
+// How each lane reads in the reasoning rail. The server routes every turn to one of these
+// before doing anything, and naming it here is what makes a misroute visible.
+const ROUTE_LABELS = {
+  chat:     'Answering from knowledge',
+  ask_page: 'Reading this page',
+  operate:  'Working on the page',
+  app:      'Using a connected app',
+};
 
 // ── Key metadata ──────────────────────────────────────────────────────────────
 // Provider keys live in storage under `apiKeys`, tool keys under `toolKeys`.
@@ -173,6 +187,7 @@ const KEY_HINTS = {
   claude:   { placeholder: 'sk-ant-api03-…', host: 'console.anthropic.com',  url: 'https://console.anthropic.com/',       prefix: 'sk-ant-' },
   gemini:   { placeholder: 'AIzaSy…',        host: 'aistudio.google.com',    url: 'https://aistudio.google.com/apikey',   prefix: 'AIza'    },
   openai:   { placeholder: 'sk-proj-…',      host: 'platform.openai.com',    url: 'https://platform.openai.com/api-keys', prefix: 'sk-'     },
+  groq:     { placeholder: 'gsk_…',          host: 'console.groq.com',       url: 'https://console.groq.com/keys',        prefix: 'gsk_'    },
   composio: { placeholder: 'ak_…',           host: 'app.composio.dev',       url: 'https://app.composio.dev/',            prefix: 'ak_'     },
 };
 
@@ -190,6 +205,11 @@ const MODELS = {
     { id: 'gemini-2.5-pro',   label: 'Gemini 2.5 Pro'   },
     { id: 'gemini-2.0-flash', label: 'Gemini 2.0 Flash' },
   ],
+  groq: [
+    { id: 'openai/gpt-oss-120b', label: 'GPT-OSS 120B' },
+    { id: 'openai/gpt-oss-20b',  label: 'GPT-OSS 20B'  },
+    { id: 'qwen/qwen3.6-27b',    label: 'Qwen3.6 27B'  },
+  ],
   claude: [
     { id: 'claude-haiku-4-5',  label: 'Claude Haiku 4.5'  },
     { id: 'claude-sonnet-4-6', label: 'Claude Sonnet 4.6' },
@@ -205,6 +225,8 @@ function dispatchFrame(parsed, h) {
   if (parsed.error)       { h.onError?.(parsed.error); return true; }
   if (parsed.done)        return true;                       // WebSocket's [DONE]
   if (parsed.status)      { h.onMeta?.(parsed); return false; }
+  if (parsed.route)       { h.onRoute?.(parsed.route); return false; }
+  if (parsed.usage)       { h.onUsage?.(parsed.usage); return false; }
   if (parsed.tool)        { h.onTool?.(parsed.tool); return false; }
   if (parsed.tool_result) { h.onToolResult?.(parsed.tool_result); return false; }
   if (parsed.text)        h.onText?.(parsed.text);
@@ -367,17 +389,23 @@ document.addEventListener('DOMContentLoaded', () => {
   let savedApiKeys      = {};
   let savedToolKeys     = {};
 
-  // ── Per-tab conversations ───────────────────────────────────────────────────
-  // The panel outlives every tab it shows, so each tab owns a View whose `el` is
-  // a DETACHED .chat-history element. Switching tabs swaps which element is
-  // attached to #responseArea; a stream in flight keeps appending to its own
-  // detached node, so switching away mid-answer and back resumes it intact —
-  // no partial-state serialization, no aborted requests.
-  const views     = new Map();   // tabId -> { el, messages, url, controller, streaming, seq }
-  const MAX_VIEWS = 15;          // bound the DOM we keep alive; LRU beyond this
-  let storedChats  = {};         // in-memory mirror of chrome.storage.local.chats
-  let activeTabId  = null;
-  let seqCounter   = 0;
+  // ── One conversation per panel ──────────────────────────────────────────────
+  // This is a side panel, not a popup: one document per window, alive across
+  // navigation and tab switches. So the chat is bound to neither. Move forward,
+  // press Back, switch tabs, open and close tabs — the same thread stays put.
+  //
+  // Binding it to a tab is what used to force a reset on every URL change, and
+  // nothing about the model needs it: _build_messages on the backend keeps only
+  // user/assistant TEXT, so no page content survives a turn anyway. Every turn
+  // re-reads whatever page is in front of it.
+  //
+  // Which tab the agent ACTS on is a separate question, resolved per turn at send
+  // time and pinned for that turn's duration. See handleQuery.
+  const chat = {
+    el: null,                    // the .chat-history element, set during init
+    messages: [], controller: null, streaming: false, pageGeneration: 0,
+  };
+  let panelWindowId = null;
 
   const STOP_ICON = `<svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>`;
   const STOP_BADGE_ICON = `<svg width="8" height="8" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>`;
@@ -411,9 +439,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // ── View plumbing ───────────────────────────────────────────────────────────
 
-  function activeView() { return activeTabId == null ? null : views.get(activeTabId); }
-
-  function isActive(view) { return view === activeView(); }
+  function activeView() { return chat; }
 
   function makeHistoryEl() {
     const el = document.createElement('div');
@@ -423,91 +449,45 @@ document.addEventListener('DOMContentLoaded', () => {
 
   function scrollToEnd(el) { el.scrollTop = el.scrollHeight; }
 
-  // Reveal the chat area — only when the view the caller wrote to is on screen.
-  function reveal(view) {
-    if (isActive(view)) responseArea.classList.add('visible');
-  }
+  function reveal() { responseArea.classList.add('visible'); }
 
-  // Swap which view's element is attached to #responseArea.
+  // Put the one chat element on screen and sync the controls to it.
   function attach(view) {
     if (responseArea.firstElementChild !== view.el) {
       responseArea.replaceChildren(view.el);
     }
     responseArea.classList.toggle('visible', view.el.childElementCount > 0);
-    // Detached elements have scrollHeight 0, so a background view's autoscroll
-    // was a no-op; catch it up now that the element has a layout box.
     scrollToEnd(view.el);
     refreshSendButton();
     refreshNewChatBtn();
   }
 
-  // Strip the fragment: in-page #anchor navigation must not wipe a conversation.
-  function pageKey(url) {
-    if (!url) return '';
-    const hash = url.indexOf('#');
-    return hash === -1 ? url : url.slice(0, hash);
-  }
-
-  function newView(tabId, url) {
-    return { tabId, el: makeHistoryEl(), messages: [], url: url || '', controller: null, streaming: false, seq: ++seqCounter };
-  }
-
-  // Get (or build) the view for a tab, resetting it if the page changed.
-  function ensureView(tab) {
-    const existing = views.get(tab.id);
-    if (existing) {
-      existing.seq = ++seqCounter;
-      if (tab.url && pageKey(existing.url) !== pageKey(tab.url)) resetView(existing, tab.url);
-      return existing;
-    }
-
-    const view = newView(tab.id, tab.url);
-    // Only adopt a stored conversation if it belongs to the page now in the tab.
-    // Tab ids are reused across browser restarts, so the id alone proves nothing.
-    const stored = storedChats[tab.id];
-    if (stored && Array.isArray(stored.messages) && stored.messages.length
-        && tab.url && pageKey(stored.url) === pageKey(tab.url)) {
-      view.messages = stored.messages;
-      renderMessages(view);
-    }
-    views.set(tab.id, view);
-    evictStaleViews();
-    return view;
-  }
-
-  // Drop the least-recently-viewed idle views. Messages are already in storage,
-  // so this only releases DOM — the view rebuilds from storage if revisited.
-  function evictStaleViews() {
-    if (views.size <= MAX_VIEWS) return;
-    const candidates = [...views.entries()]
-      .filter(([id, v]) => id !== activeTabId && !v.streaming)
-      .sort((a, b) => a[1].seq - b[1].seq);
-    for (const [id] of candidates) {
-      if (views.size <= MAX_VIEWS) break;
-      views.delete(id);
-    }
-  }
-
-  function resetView(view, url) {
-    view.controller?.abort();   // the answer was about the page we just left
+  // Empty the conversation. The only thing that clears a chat now is the user asking.
+  function resetView(view) {
+    view.controller?.abort();
     setStreaming(view, false);
     view.messages = [];
-    view.url      = url || '';
     view.el.replaceChildren();
-    delete storedChats[view.tabId];
-    chrome.storage.local.set({ chats: storedChats });
-    if (isActive(view)) {
-      responseArea.classList.remove('visible');
-      refreshNewChatBtn();
-    }
+    saveChat(view);
+    responseArea.classList.remove('visible');
+    refreshNewChatBtn();
   }
 
   // ── Chat persistence ────────────────────────────────────────────────────
+  // One top-level key per WINDOW, because a side panel is one document per window.
+  // A nested { [windowId]: messages } object would not do: storage.local.set writes
+  // whole values, so each panel would overwrite the other window's entry with its own
+  // mirror. A key per window makes that impossible, and needs no read-modify-write.
+  //
+  // Window ids do not survive a browser restart, so a new session starts fresh.
+
+  const CHAT_KEY = (id) => `panelChat:${id}`;
 
   function saveChat(view) {
-    if (view.tabId == null) return;
-    storedChats[view.tabId] = { url: view.url, messages: view.messages };
-    chrome.storage.local.set({ chats: storedChats });
+    if (panelWindowId == null) return;
+    const key = CHAT_KEY(panelWindowId);
+    if (view.messages.length) chrome.storage.local.set({ [key]: view.messages });
+    else chrome.storage.local.remove(key);
   }
 
   function renderMessages(view) {
@@ -548,7 +528,8 @@ document.addEventListener('DOMContentLoaded', () => {
         }
       }
       turnEl.appendChild(rail);
-      foldRail(turnEl, rail, toolCount || steps.length, msg.durationMs, { stopped: !!msg.interrupted });
+      foldRail(turnEl, rail, toolCount || steps.length, msg.durationMs,
+               { stopped: !!msg.interrupted, usage: msg.usage || null });
     }
 
     const { card, body } = makeCard(msg.provider, msg.model);
@@ -561,8 +542,7 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   function clearActiveChat() {
-    const view = activeView();
-    if (view) resetView(view, view.url);
+    resetView(chat);
   }
 
   // Nothing to start over from on an empty chat — say so rather than no-op
@@ -583,6 +563,14 @@ document.addEventListener('DOMContentLoaded', () => {
     if (res.apiProvider && res.apiKey && !savedApiKeys[res.apiProvider])
       savedApiKeys[res.apiProvider] = res.apiKey;
 
+    // Drop keys for providers this build no longer ships (a renamed or removed
+    // provider), so a stale `selectedProvider` can't point at a missing model list.
+    const stale = Object.keys(savedApiKeys).filter(p => !MODELS[p]);
+    if (stale.length) {
+      stale.forEach(p => delete savedApiKeys[p]);
+      chrome.storage.local.set({ apiKeys: savedApiKeys });
+    }
+
     const lastProvider = res.selectedProvider && savedApiKeys[res.selectedProvider]
       ? res.selectedProvider : null;
     selectedProvider = lastProvider || PROVIDER_ORDER.find(p => savedApiKeys[p]) || null;
@@ -596,28 +584,21 @@ document.addEventListener('DOMContentLoaded', () => {
     renderModelBtn();
   }
 
-  // Build `storedChats`: migrate the pre-side-panel flat keys, then drop entries
-  // whose tab is gone. Tab ids are recycled across restarts, so this prunes the
-  // obvious dead ones; ensureView() still URL-checks before adopting a chat.
-  async function loadChats(activeTab) {
-    const res   = await chrome.storage.local.get(['chats', 'chatMessages', 'chatPageUrl']);
-    const chats = { ...(res.chats || {}) };
+  // Return this window's stored conversation, and tidy up on the way through: the
+  // per-tab shapes this replaced, plus keys for windows that no longer exist.
+  //
+  // `chats` and `chatMessages`/`chatPageUrl` were keyed by TAB. Tab ids and window ids
+  // share a number space, so a leftover chats['101'] would read as window 101 — hence a
+  // new key namespace rather than a migration.
+  async function loadChat() {
+    const all   = await chrome.storage.local.get(null);
+    const live  = new Set((await chrome.tabs.query({})).map(t => CHAT_KEY(t.windowId)));
+    const stale = ['chats', 'chatMessages', 'chatPageUrl'].filter(k => all[k] !== undefined);
+    const dead  = Object.keys(all).filter(k => k.startsWith('panelChat:') && !live.has(k));
+    if (stale.length || dead.length) chrome.storage.local.remove([...stale, ...dead]);
 
-    const legacy = Array.isArray(res.chatMessages) ? res.chatMessages : null;
-    if (legacy?.length && activeTab?.url && res.chatPageUrl
-        && pageKey(res.chatPageUrl) === pageKey(activeTab.url)) {
-      chats[activeTab.id] = { url: activeTab.url, messages: legacy };
-    }
-    if (res.chatMessages !== undefined || res.chatPageUrl !== undefined) {
-      chrome.storage.local.remove(['chatMessages', 'chatPageUrl']);
-    }
-
-    const live = new Set((await chrome.tabs.query({})).map(t => String(t.id)));
-    storedChats = {};
-    for (const [id, entry] of Object.entries(chats)) {
-      if (live.has(id)) storedChats[id] = entry;
-    }
-    chrome.storage.local.set({ chats: storedChats });
+    const mine = all[CHAT_KEY(panelWindowId)];
+    return Array.isArray(mine) ? mine : [];
   }
 
   // ── Active-page indicator ──────────────────────────────────────────────────
@@ -637,22 +618,21 @@ document.addEventListener('DOMContentLoaded', () => {
     pageIndicator.classList.add('visible');
   }
 
-  // ── Tab tracking — the panel persists, so it has to follow the browser ─────
+  // ── Tab tracking ───────────────────────────────────────────────────────────
+  // The chat no longer cares which tab is in front. These listeners only keep the
+  // header indicator honest, so the user can see which page the agent would act on.
 
-  let panelWindowId = -1;   // chrome.windows.WINDOW_ID_NONE
-  let pendingTabId  = null;
+  let shownTabId = null;
 
   async function showTab(tabId) {
-    pendingTabId = tabId;
+    shownTabId = tabId;
     const tab = await chrome.tabs.get(tabId).catch(() => null);
     // Fast switching can resolve these out of order — only the newest wins.
-    if (!tab || pendingTabId !== tabId) return;
-    activeTabId = tab.id;
-    attach(ensureView(tab));
+    if (!tab || shownTabId !== tabId) return;
     renderPageIndicator(tab);
   }
 
-  // onActivated/onUpdated fire for every window; this panel owns exactly one.
+  // These fire for every window; this panel owns exactly one.
   chrome.tabs.onActivated.addListener(({ tabId, windowId }) => {
     if (windowId !== panelWindowId) return;
     showTab(tabId);
@@ -660,28 +640,10 @@ document.addEventListener('DOMContentLoaded', () => {
 
   chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     if (tab.windowId !== panelWindowId) return;
-    if (changeInfo.url) {
-      const view = views.get(tabId);
-      if (view && pageKey(view.url) !== pageKey(changeInfo.url)) {
-        // A navigation during a live turn is usually the agent's own doing — clearing the
-        // chat here would destroy the very conversation driving it. Follow the URL and
-        // keep the history; only an idle tab gets a fresh chat for a new page.
-        if (view.streaming) view.url = changeInfo.url;
-        else resetView(view, changeInfo.url);
-      } else if (view) {
-        view.url = changeInfo.url;   // same page, new fragment
-      }
-    }
     // Favicon and title land after the URL, so refresh the header on those too.
-    if (tabId === activeTabId && (changeInfo.url || changeInfo.favIconUrl || changeInfo.title)) {
+    if (tabId === shownTabId && (changeInfo.url || changeInfo.favIconUrl || changeInfo.title)) {
       renderPageIndicator(tab);
     }
-  });
-
-  chrome.tabs.onRemoved.addListener((tabId) => {
-    views.get(tabId)?.controller?.abort();
-    views.delete(tabId);
-    delete storedChats[tabId];   // background.js clears the persisted copy
   });
 
   (async () => {
@@ -689,7 +651,15 @@ document.addEventListener('DOMContentLoaded', () => {
     updateSetupGate();
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (tab?.windowId != null) panelWindowId = tab.windowId;
-    await loadChats(tab);
+    const saved = await loadChat();
+
+    chat.el = makeHistoryEl();
+    if (saved.length) {
+      chat.messages = saved;
+      renderMessages(chat);
+    }
+    attach(chat);
+
     if (tab?.id != null) await showTab(tab.id);
     else refreshSendButton();
   })();
@@ -953,13 +923,22 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   // Collapse a finished rail into a "Whispered through N steps · Ns" chip
-  function foldRail(turnEl, railEl, stepCount, durationMs, { stopped = false } = {}) {
+  // Tokens are shown as "1.3k" rather than exactly: the useful signal is order of
+  // magnitude — whether a turn cost hundreds or tens of thousands.
+  function formatTokens(n) {
+    if (!n) return '';
+    return n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k` : String(n);
+  }
+
+  function foldRail(turnEl, railEl, stepCount, durationMs, { stopped = false, usage = null } = {}) {
     const secs = durationMs ? Math.max(1, Math.round(durationMs / 1000)) : null;
     const chip = document.createElement('button');
     chip.type = 'button';
     chip.className = 'trace-chip';
     const verb  = stopped ? 'Stopped after' : 'Whispered through';
-    const label = `${verb} ${stepCount} step${stepCount === 1 ? '' : 's'}${secs ? ` · ${secs}s` : ''}`;
+    const toks  = usage?.total ? ` · ${formatTokens(usage.total)} tokens` : '';
+    const label = `${verb} ${stepCount} step${stepCount === 1 ? '' : 's'}` +
+                  `${secs ? ` · ${secs}s` : ''}${toks}`;
     chip.innerHTML = `<span class="chip-chev">${CHEVRON_ICON}</span><span>${escHtml(label)}</span>`;
     railEl.classList.add('collapsed');
     chip.addEventListener('click', () => {
@@ -971,7 +950,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Live streaming controller for one AI turn (reasoning rail + answer card)
   function createAiTurn(view, provider, model) {
-    reveal(view);
+    reveal();
 
     const wrap = document.createElement('div');
     wrap.className = 'chat-msg ai';
@@ -1000,6 +979,7 @@ document.addEventListener('DOMContentLoaded', () => {
     let lastToolEl = null;      // for collapsing consecutive identical calls
     let answer    = '';         // provisional final-answer markdown
     let toolCount = 0;
+    let turnUsage = null;       // token total, once the server reports it
 
     // The waiting row is shown whenever the turn is live and nothing else is
     // animating — notably BETWEEN steps, which is where the agent actually
@@ -1102,6 +1082,19 @@ document.addEventListener('DOMContentLoaded', () => {
         toolCount++;
         scrollToEnd(view.el);
       },
+      // Which lane took the turn. Shown as a rail step so a misroute is visible in the
+      // trace rather than something to be inferred from which tools ran.
+      onRoute(lane) {
+        const label = ROUTE_LABELS[lane] || `Routing: ${lane}`;
+        steps.push({ kind: 'tool', name: `route:${lane}`, label, count: 1 });
+        const el = railToolEl(label, { done: true });
+        rail.appendChild(el);
+        lastToolEl = null;   // a route is never the target of a tool_result tick
+        scrollToEnd(view.el);
+      },
+      onUsage(u) {
+        turnUsage = u;
+      },
       onToolResult(res) {
         const ref = res && res.id != null ? toolEls[res.id] : null;
         if (ref) {
@@ -1124,7 +1117,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const durationMs = Date.now() - startTs;
         const ts = Date.now();
         if (toolCount > 0 || steps.length > 0) {
-          foldRail(turnEl, rail, toolCount || steps.length, durationMs);
+          foldRail(turnEl, rail, toolCount || steps.length, durationMs, { usage: turnUsage });
         } else {
           rail.remove();
         }
@@ -1132,7 +1125,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (!answer.trim()) body.innerHTML = emptyBodyHTML(false);
         addCardFooter(card, ts, answer);
         scrollToEnd(view.el);
-        return { content: answer, provider, model, ts, durationMs, steps };
+        return { content: answer, provider, model, ts, durationMs, steps, usage: turnUsage };
       },
       // The user hit stop. Same shape as finish(), but the turn is labelled as cut short
       // instead of being deleted — a vanished bubble leaves the question looking ignored.
@@ -1148,7 +1141,8 @@ document.addEventListener('DOMContentLoaded', () => {
         const durationMs = Date.now() - startTs;
         const ts = Date.now();
         if (toolCount > 0 || steps.length > 0) {
-          foldRail(turnEl, rail, toolCount || steps.length, durationMs, { stopped: true });
+          foldRail(turnEl, rail, toolCount || steps.length, durationMs,
+                   { stopped: true, usage: turnUsage });
         } else {
           rail.remove();
         }
@@ -1156,7 +1150,8 @@ document.addEventListener('DOMContentLoaded', () => {
         if (!answer.trim()) body.innerHTML = emptyBodyHTML(true);
         addCardFooter(card, ts, answer, { interrupted: true });
         scrollToEnd(view.el);
-        return { content: answer, provider, model, ts, durationMs, steps, interrupted: true };
+        return { content: answer, provider, model, ts, durationMs, steps,
+                 usage: turnUsage, interrupted: true };
       },
       fail(text) {
         hideWaiting();
@@ -1171,15 +1166,15 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   // Standalone error bubble (used before a turn exists, e.g. missing key)
-  function showError(text, view = activeView()) {
-    if (!view) { console.error('SiteWhisper:', text); return; }   // no tab bound yet
-    reveal(view);
+  function showError(text, view = chat) {
+    if (!view.el) { console.error('SiteWhisper:', text); return; }   // panel still initialising
+    reveal();
     const wrap = document.createElement('div');
     wrap.className = 'chat-msg ai';
     wrap.innerHTML = `<div class="ai-turn"><div class="ai-card"><div class="ai-card-body error">${escHtml(text)}</div></div></div>`;
     view.el.appendChild(wrap);
     scrollToEnd(view.el);
-    if (isActive(view)) refreshNewChatBtn();
+    refreshNewChatBtn();
   }
 
   // ── Provider / model buttons ───────────────────────────────────────────────
@@ -1478,11 +1473,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // ── Context fetching ───────────────────────────────────────────────────────
 
+  // The page's visible prose. Read live, when the tool runs — goto and act move the page
+  // mid-turn, so anything captured earlier is about wherever the agent used to be.
   function getPageText(tab, cb, fail) {
     if (!tab || tab.id == null) { fail('Cannot access this page (try a regular http/https page).'); return; }
 
-    // Inject on-demand so it works on tabs that were already open before the
-    // extension loaded (declared content scripts only reach pages opened after).
+    // Inject on demand so it works on tabs that were already open before the extension
+    // loaded — declared content scripts only reach pages opened after.
     chrome.scripting.executeScript(
       {
         target: { tabId: tab.id },
@@ -1537,7 +1534,15 @@ document.addEventListener('DOMContentLoaded', () => {
   // read_page and act execute here, not on the server: the server has no DOM. Over the
   // socket the agent asks for them mid-run and waits for the answer.
 
-  const SNAP_LINE = /^\[(\d+)\]\s+(\S+)(?:\s+"([^"]*)")?/;
+  // Mirrors content.js describe(): "15 button Delete account", with optional " = value",
+  // " [flags]" and " options: ..." suffixes. Unquoted names mean the name is whatever is
+  // left after those suffixes are stripped — see the same logic in server.py.
+  const SNAP_LINE     = /^(\d+)\s+(\S+)(?:\s+(.*))?$/;
+  const SNAP_SUFFIXES = [/\s+options:\s.*$/, /\s+\[[^\]]*\]$/, /\s+=\s.*$/];
+
+  function snapName(rest) {
+    return SNAP_SUFFIXES.reduce((acc, re) => acc.replace(re, ''), rest || '').trim();
+  }
 
   // The panel needs the element names to judge whether an action is consequential, and the
   // snapshot text is the only place it has them.
@@ -1545,7 +1550,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const map = new Map();
     for (const line of String(text || '').split('\n')) {
       const m = SNAP_LINE.exec(line);
-      if (m) map.set(Number(m[1]), { role: m[2], name: m[3] || '' });
+      if (m) map.set(Number(m[1]), { role: m[2], name: snapName(m[3]) });
     }
     return map;
   }
@@ -1568,14 +1573,40 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Flattened into prose because the model reads this as a tool result.
   function formatActResult(res) {
-    if (!res)       return 'The page did not respond. It may have navigated away.';
-    if (res.error)  return res.error;
-    const lines = (res.results || []).map((r) => `${r.ok ? 'ok' : 'FAILED'}: ${r.detail}`);
+    if (!res) return 'The page did not respond. It may have navigated away.';
+
+    // A refusal used to return here with the reason and nothing else, which cost the agent
+    // a whole read_page before it could try anything — the map it needed was one field away
+    // the entire time. Anything the page sent back gets rendered below.
+    if (res.error && !res.snapshot) return res.error;
+
+    const lines = res.error
+      ? [res.error]
+      : (res.results || []).map((r) => `${r.ok ? 'ok' : 'FAILED'}: ${r.detail}`);
     if (res.remaining) {
       lines.push(`Stopped after action ${res.stopped_after + 1} because it changes the page; ` +
                  `${res.remaining} later action(s) were not run. Continue from the snapshot below.`);
     }
-    return (lines.join('\n') || 'Nothing to do.') + '\n\n' + (res.snapshot || '');
+    // The effect, ahead of the map. A click that opened a dialog and a click that did
+    // nothing used to produce identical text, so the model had to infer from the snapshot
+    // whether its action worked — and when the snapshot was the thing that was wrong, it
+    // concluded the click had failed and retried.
+    if (res.drift)   lines.push(`note: ${res.drift}`);
+    if (res.changed) lines.push(`→ ${res.changed}`);
+
+    // An act result appends the map as a convenience, so when the map is byte-identical to
+    // the one the model already has, saying so costs a line instead of ~1,000 tokens. Only
+    // safe here: content.js decides `unchanged` by comparing the real serialization, and an
+    // explicit read_page is never answered this way, since re-reading is how the agent
+    // recovers a map that has been dropped from its context.
+    // The recovery hint matters: context editing can clear the earlier map, so "unchanged"
+    // must never be the only thing standing between the agent and a map it no longer holds.
+    const tail = res.unchanged
+      ? 'The element map is unchanged, so the ids you already have are still valid. ' +
+        'If you no longer have that map, call read_page.'
+      : (res.snapshot || '');
+
+    return (lines.join('\n') || 'Nothing to do.') + '\n\n' + tail;
   }
 
   function sendToPage(tab, message) {
@@ -1627,7 +1658,7 @@ document.addEventListener('DOMContentLoaded', () => {
     let tab = { id: tabId };
     try {
       const fresh = await chrome.tabs.get(tabId);
-      if (fresh) { tab = fresh; if (view && fresh.url) view.url = fresh.url; }
+      if (fresh) tab = fresh;
     } catch { /* the tab went away; the snapshot attempt below will fail cleanly */ }
 
     const res = await new Promise((resolve) => getPageSnapshot(tab, resolve));
@@ -1657,6 +1688,13 @@ document.addEventListener('DOMContentLoaded', () => {
       return 'That tab is no longer open.';
     }
     if (!tab || tab.id == null) return 'No page is available to act on.';
+
+    // `tab` was re-resolved from the pinned tabId just above, so this reads whatever page
+    // the agent has navigated to, not the one the turn started on.
+    if (name === 'read_text') {
+      return await new Promise((resolve) =>
+        getPageText(tab, (text) => resolve(text || ''), (msg) => resolve(msg)));
+    }
 
     if (name === 'read_page') {
       const res = await new Promise((resolve) => getPageSnapshot(tab, resolve));
@@ -1705,28 +1743,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // ── Main handler ───────────────────────────────────────────────────────────
 
-  // An interrupted turn must not read back to the model as a finished answer — and an empty
-  // assistant message is rejected outright by Anthropic, so it never goes over the wire bare.
-  function historyEntry(m) {
-    const content = m.content || '';
-    if (m.role !== 'assistant' || !m.interrupted) return { role: m.role, content };
-    const partial = content.trim();
-    return {
-      role: 'assistant',
-      content: partial
-        ? `${partial}\n\n[interrupted by the user before this answer was finished]`
-        : '[interrupted by the user before answering]',
-    };
-  }
-
   async function handleQuery(tab, view, query, turn) {
     const key = savedApiKeys[selectedProvider];
     if (!key) { turn.fail('No API key for this provider. Open the ☰ menu → API Keys.'); return; }
 
-    getPageText(tab, async (text) => {
-      // Two payloads doing two different jobs: `text` is prose for answering questions,
-      // `snapshot` is the element map for acting. The snapshot also seeds the generation
-      // that content.js checks before it will touch anything.
+    {
+      // The snapshot is the element map for acting; it also seeds the generation that
+      // content.js checks before it will touch anything.
       const snapRes  = await new Promise((resolve) => getPageSnapshot(tab, resolve));
       const snapshot = recordSnapshot(view, snapRes);
 
@@ -1749,19 +1772,21 @@ document.addEventListener('DOMContentLoaded', () => {
 
       const payload = {
         query,
-        text:      text || '',
         snapshot:  snapshot || '',
         mode:      agentMode,
         model:     selectedModel?.id,
-        history:   view.messages.slice(0, -1).map(historyEntry),
+        // No conversation goes up. Each message is a self-contained job that finishes
+        // inside its own turn, so previous turns are cost without purpose — see
+        // _build_messages in the backend. The panel still shows and stores everything;
+        // this only governs what the model is given.
         tool_keys: savedToolKeys,
       };
-      if (selectedProvider === 'claude' && savedApiKeys.gemini)
-        payload.gemini_key = savedApiKeys.gemini;
 
       let errored = false;
       const handlers = {
         onMeta:       () => {},
+        onRoute:      (lane) => turn.onRoute(lane),
+        onUsage:      (u)    => turn.onUsage(u),
         onTool:       (tool) => turn.onTool(tool),
         onToolResult: (res)  => turn.onToolResult(res),
         onText:       (t)    => turn.onText(t),
@@ -1794,13 +1819,18 @@ document.addEventListener('DOMContentLoaded', () => {
       }
 
       if (!done) {
+        // Best-effort: a page that will not yield its text degrades to a knowledge answer,
+        // which is why this resolves to '' instead of failing the turn.
+        const pageText = await new Promise((resolve) =>
+          getPageText(tab, (t) => resolve(t || ''), () => resolve('')));
+
         let response;
         try {
           response = await fetch(`${BACKEND}/chat`, {
             method:  'POST',
             headers: { 'Content-Type': 'application/json', 'Token': key, 'Provider': selectedProvider },
             signal:  controller.signal,
-            body: JSON.stringify(payload),
+            body: JSON.stringify({ ...payload, text: pageText }),
           });
         } catch (err) {
           if (err.name === 'AbortError') { endAborted(); return; }
@@ -1830,7 +1860,7 @@ document.addEventListener('DOMContentLoaded', () => {
       } else {
         turn.discard();
       }
-    }, (m) => { setStreaming(view, false); turn.fail(m); });
+    }
   }
 
   // ── Input handling ─────────────────────────────────────────────────────────
@@ -1872,12 +1902,11 @@ document.addEventListener('DOMContentLoaded', () => {
         showError('Cannot access this page (try a regular http/https page).');
         return;
       }
-      activeTabId = pendingTabId = tab.id;   // also cancels any in-flight showTab
-      const view  = ensureView(tab);
-      if (tab.url) view.url = tab.url;
-      attach(view);
+      shownTabId = tab.id;   // also cancels any in-flight showTab
+      const view = chat;
+      renderPageIndicator(tab);
 
-      reveal(view);
+      reveal();
       const userWrap = document.createElement('div');
       userWrap.className = 'chat-msg user';
       userWrap.innerHTML = `<div class="chat-bubble user-bubble">${escHtml(query)}</div>`;

@@ -3,6 +3,7 @@ import json
 import os
 import re
 import uuid
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Optional
@@ -34,9 +35,6 @@ from langchain_core.messages import ToolMessage
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 from langchain_core.tools import tool
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
 
 app = FastAPI()
 
@@ -79,28 +77,243 @@ MODEL_CALL_LIMIT       = 25
 TOOL_CALL_LIMIT        = 30
 IDENTICAL_CALL_LIMIT   = 2
 
-SYSTEM_PROMPT = (
+# Transcript size at which page *text* starts being cleared. Sized to one turn's working
+# set rather than to a context window: the point is to keep each model call small, because
+# every call re-sends everything before it. Element maps are handled by
+# TrimSupersededMaps instead, which needs no threshold.
+TEXT_CLEAR_TRIGGER = 6_000
+
+# Tools that only look. Never rate-limited, and each one re-opens every action: see
+# RepeatedToolCallGuard. `find` is listed ahead of existing to keep the two in step.
+OBSERVATION_TOOLS = frozenset({"read_page", "read_text", "find",
+                               "search_page", "summarize_page"})
+
+# ── Prompt fragments ──────────────────────────────────────────────────────────
+# The prompt is assembled per lane from the fragments of the tools that lane actually
+# received, so a turn never reads instructions for tools it does not have. Each fragment
+# is attached to its tool in CAPABILITIES below — adding a tool adds its guidance.
+
+PROMPT_BASE = (
     "You are SiteWhisper, a helpful AI assistant. "
     "You have access to tools — use them when they can help answer the user's question. "
     "If no tool is needed, answer directly from your knowledge.\n\n"
     "Handling tool failures: if a tool call fails or returns an error, do NOT reissue the "
     "same call with the same arguments. Read the error, correct the arguments, and try once "
-    "more. If it fails again, stop and tell the user what went wrong.\n\n"
+    "more. If it fails again, stop and tell the user what went wrong."
+)
+
+PROMPT_ASK_USER = (
     "Missing information: when you need something only the user can supply — a value for a "
     "form field, a choice between paths, a detail you would otherwise be guessing at — call "
     "the ask_user tool. Do not invent the value, and do not end your turn to ask in prose: "
     "ask_user keeps the task running and brings their answer straight back to you.\n\n"
     "Some actions pause for the user's approval. If one comes back rejected, do not retry "
-    "it — say what you were going to do and let them decide.\n\n"
-    "Moving between pages: if a link to where you want to go is visible on the page, click "
-    "it — only use goto when you know the address or the user gave you one. Guessing a URL "
-    "usually lands on a missing page.\n\n"
-    "After an action: act and goto both return the page's element map as it is after they "
-    "ran, so use it directly rather than calling read_page to confirm. Element numbers "
-    "belong to one page — ids from before a navigation are dead. If the returned map looks "
-    "empty or is missing something you expected, the page was probably still loading; then "
-    "call read_page again."
+    "it — say what you were going to do and let them decide."
 )
+
+PROMPT_BROWSING = (
+    "Reaching the internet: you have no search tool, but you have a browser — that IS your "
+    "internet access. Never tell the user you cannot look something up. Put the query "
+    "straight into a search address and go there: https://duckduckgo.com/?q=your+query, or "
+    "https://www.google.com/search?q=your+query, with spaces written as +. If a results "
+    "page needs the box filled in instead, type into it and press Enter.\n\n"
+    "Moving between pages: if a link to where you want to go is visible on the page, click "
+    "it. Otherwise use goto — with an address the user gave you, one you know, or a search "
+    "address as above. Do not invent a deep link and hope; guessed URLs land on missing "
+    "pages."
+)
+
+PROMPT_READING = (
+    "Reading a page: read_text gives you its visible text — use it for any question about "
+    "what a page says. read_page gives the interactive elements instead — links, buttons, "
+    "inputs — which is what you need in order to act. A results page already lists its "
+    "results as links in the element map, so read_text is usually unnecessary there; open "
+    "the page you want and read_text that."
+)
+
+# Ids are written bare — "12 link Main page" — because the element map dropped its brackets
+# and quotes; 71% of every line was punctuation. Keep these examples in step with
+# content.js describe().
+PROMPT_ACTING = (
+    "Element numbers are names, not positions. A number stays with the same control for as "
+    "long as that control is on the page, so a number you were given earlier still means "
+    "the same thing even after the page has changed around it. The ORDER OF THE LINES is "
+    "the order things appear on the page — read 'the first one' off the line order, never "
+    "off the numbers. Numbers from a different page are dead; using one tells you so.\n\n"
+    "Finishing: a request that names one target — the first mail, the top result, that "
+    "button — is done as soon as one action on it succeeds. When the result says it worked, "
+    "say what you did and stop. Do not repeat it on whatever has since moved into that "
+    "position: the map that comes back is there so you can continue a longer task, not a "
+    "list of more work to do.\n\n"
+    "After an action: act and goto both return the page's element map as it is after they "
+    "ran, so start from that rather than re-reading out of habit. If a result says the map "
+    "is unchanged, the numbers you already have are still valid; do not re-read for them. "
+    "If one action in a batch failed, the ones before it still happened.\n\n"
+    "When something you expected is NOT in the map, do not conclude it is absent and do "
+    "not repeat the same action hoping for a different result. The map can be wrong in "
+    "several ways, so work through them:\n"
+    "- The map is capped, and says so in its header when it truncates. A control can be "
+    "present on the page and simply not listed.\n"
+    "- If you opened a menu, dialog or overlay, what you want is inside it. Read the page "
+    "again — an overlay changes the map completely.\n"
+    "- The page may still have been rendering when the map was taken. Run act with "
+    '{"verb":"wait"} and look again.\n'
+    "- If a control is on screen but unlistable, act on what has focus instead: press and "
+    "submit work with no id. A dialog usually focuses its input the moment it opens.\n"
+    "- If none of that works, ask_user what they can see. Do not just report failure while "
+    "you still have moves left.\n\n"
+    "Reading the page again is always allowed and never counts against you."
+)
+
+PROMPT_RETRIEVAL = (
+    "Answering about this page: call search_page with the part of the question you are "
+    "looking for. It returns the passages of the page that match, not the whole page, so "
+    "ask it more than once with different wording rather than guessing from one result. "
+    "Answer only from what it returns — if the passages do not contain the answer, say so "
+    "instead of filling the gap from memory.\n\n"
+    "Use summarize_page when the user wants the whole page: a summary, an overview, or "
+    "'what is this about'."
+)
+
+PROMPT_ESCALATE = (
+    "You cannot act on the page in this turn — you have no click, type or navigate tool. "
+    "The moment the request needs one, call escalate with a one-line reason and stop; the "
+    "task is handed straight to the tools that can do it. Never claim you performed an "
+    "action, and never guess at page content you were not given."
+)
+
+
+# ── Lane + capability registry ────────────────────────────────────────────────
+# One declaration per tool decides three things at once: which lanes may offer it, what
+# guidance joins the prompt when it does, and (via LANES) what the router is told about
+# its lane. Adding a tool means adding one entry here — no routing code to touch.
+
+LANE_CHAT     = "chat"
+LANE_ASK_PAGE = "ask_page"
+LANE_OPERATE  = "operate"
+LANE_APP      = "app"
+
+
+@dataclass(frozen=True)
+class Lane:
+    # What the router reads when choosing. This text IS the routing rule.
+    description:   str
+    # Requires a live browser round trip, so it exists only on the socket transport.
+    needs_browser: bool = False
+
+
+LANES: dict[str, Lane] = {
+    LANE_CHAT: Lane(
+        description=("general conversation, greetings, or a knowledge question that does "
+                     "not depend on the page the user is looking at"),
+    ),
+    LANE_ASK_PAGE: Lane(
+        description=("a question about the page the user is on: what it says, finding "
+                     "something in it, summarising it, giving an overview, or explaining "
+                     "what it is about"),
+    ),
+    LANE_OPERATE: Lane(
+        description=("the user wants something DONE in the browser: click, type, fill, "
+                     "scroll, navigate, go back, open a site, search the web, or any "
+                     "multi-step task. Covers anything doable on the page they are looking "
+                     "at, including acting inside a web app they already have open"),
+        needs_browser=True,
+    ),
+    LANE_APP: Lane(
+        # "not looking at" is the whole distinction. Without it, "delete the first mail"
+        # routed here purely because it says mail — while the user was sitting on Gmail
+        # with the mail in front of them — and the turn spent a model call escalating.
+        description=("an action in an outside service the user is NOT currently looking "
+                     "at, reached through a connected account rather than through the "
+                     "page in front of them"),
+    ),
+}
+
+# Lanes that cannot act on the page, and therefore get `escalate`.
+ESCALATING_LANES = frozenset({LANE_CHAT, LANE_ASK_PAGE, LANE_APP})
+
+# On router failure, fall back to the lane that can do the most — behaving exactly as the
+# single-agent design did — rather than silently answering with fewer tools than the task
+# needs. Downgraded to ASK_PAGE when there is no browser.
+FALLBACK_LANE = LANE_OPERATE
+
+
+@dataclass(frozen=True)
+class Cap:
+    """Which lanes may offer a tool, and the prompt guidance that comes with it."""
+    lanes:  frozenset
+    prompt: Optional[str] = None
+
+
+CAPABILITIES: dict[str, Cap] = {
+    "search_page":    Cap(frozenset({LANE_ASK_PAGE}),                prompt=PROMPT_RETRIEVAL),
+    "summarize_page": Cap(frozenset({LANE_ASK_PAGE, LANE_OPERATE, LANE_APP})),
+    "read_text":      Cap(frozenset({LANE_OPERATE}),                 prompt=PROMPT_READING),
+    "read_page":      Cap(frozenset({LANE_ASK_PAGE, LANE_OPERATE})),
+    "act":            Cap(frozenset({LANE_OPERATE}),                 prompt=PROMPT_ACTING),
+    "goto":           Cap(frozenset({LANE_OPERATE}),                 prompt=PROMPT_BROWSING),
+    "ask_user":       Cap(frozenset({LANE_OPERATE}),                 prompt=PROMPT_ASK_USER),
+    "escalate":       Cap(frozenset(ESCALATING_LANES),               prompt=PROMPT_ESCALATE),
+}
+
+# Anything not declared above is an external integration (Composio ships its tools at
+# runtime, named per toolkit), so it lands in the app lane without needing an entry.
+DEFAULT_CAP = Cap(frozenset({LANE_APP}))
+
+
+def _cap(name: str) -> Cap:
+    return CAPABILITIES.get(name, DEFAULT_CAP)
+
+
+# The order fragments appear in is not cosmetic. Composing them in registry order put the
+# ask_user guidance last, and the model then reached for ask_user instead of act — on a
+# task the original prompt completed with three act calls. This sequence reproduces the
+# order of the prompt that was tuned by use: what the agent should do comes before how to
+# ask for help, and the acting rules (with the "not in the map" ladder) close the prompt.
+# Anything not listed still gets appended, so a new tool contributes without editing this.
+PROMPT_SEQUENCE = ("ask_user", "goto", "read_text", "search_page", "act", "escalate")
+
+
+_SNAP_HEADER = {"page": re.compile(r'^page:\s*(.+)$', re.M),
+                "url":  re.compile(r'^url:\s*(.+)$',  re.M)}
+
+
+def _page_hint(snapshot: str) -> str:
+    """One line naming the page the user is on, from the map header the panel already sends.
+
+    Costs ~20 tokens and removes a whole class of stall: without it the agent cannot tell
+    whether a page is open at all, and asking the user which page they mean is a reasonable
+    thing to do when nothing has said.
+    """
+    if not snapshot:
+        return ""
+    title = _SNAP_HEADER["page"].search(snapshot)
+    url   = _SNAP_HEADER["url"].search(snapshot)
+    if not (title or url):
+        return ""
+    where = " — ".join(x.group(1).strip() for x in (title, url) if x)
+    return (f"The user is looking at this page right now: {where}\n"
+            "That is the page your tools act on. You do not need to ask which page they "
+            "mean, and you do not need its address to work on it.")
+
+
+def _lane_prompt(tools: list, page_hint: str = "") -> str:
+    """Compose the system prompt from the tools this lane actually received."""
+    have  = {getattr(t, "name", "") for t in tools}
+    order = [n for n in PROMPT_SEQUENCE if n in CAPABILITIES]
+    order += [n for n in CAPABILITIES if n not in order]
+
+    parts, seen = [PROMPT_BASE], {PROMPT_BASE}
+    if page_hint:
+        parts.append(page_hint)
+    for name in order:
+        fragment = CAPABILITIES[name].prompt
+        # Identity check, not equality: two tools may legitimately share one fragment and
+        # it must still appear once.
+        if fragment and name in have and fragment not in seen:
+            parts.append(fragment)
+            seen.add(fragment)
+    return "\n\n".join(parts)
 
 
 def _on_tool_error(exc: Exception, request) -> str:
@@ -120,11 +333,26 @@ def _on_tool_error(exc: Exception, request) -> str:
 
 
 class RepeatedToolCallGuard(AgentMiddleware):
-    """Refuse a tool call already made with byte-identical arguments.
+    """Refuse an action already tried, byte-identical, since the last look at the page.
 
     ToolCallLimitMiddleware caps calls per tool *name*, which cannot catch this without
     knowing the offending name up front — and with Composio the real action is a
     parameter, not the tool name. Matching on (name, args) instead is name-agnostic.
+
+    Two things this deliberately does NOT do, both learned the hard way:
+
+    Observation is never blocked. read_page and read_text take no arguments, so keying on
+    (name, args) alone made their keys the constants "read_page::{}" and "read_text::{}" —
+    which capped LOOKING at the page to twice per run. Re-observing is precisely how an
+    agent recovers from an incomplete snapshot, and the system prompt tells it to; blocking
+    that turned a recoverable state into a dead end.
+
+    Counters are scoped to an epoch that every observation bumps, so the rule reads "you
+    already tried this and you have not looked since" rather than "you tried this once, in
+    this run, on some page". A fresh look re-opens every action — the agent has new
+    information, so the same click may now be the right move. It also stops a low element
+    id on page B colliding with the same id on page A, since ids are small integers and the
+    JSON is byte-identical across pages.
 
     State is per-instance, which is per-request here: the agent (and so this middleware)
     is constructed inside the request handler, not cached like the LLM clients are.
@@ -135,28 +363,42 @@ class RepeatedToolCallGuard(AgentMiddleware):
         self.limit  = limit
         self.tools  = []          # registers no tools of its own
         self._seen: dict[str, int] = {}
+        self._epoch = 0
 
     def _exhausted(self, request) -> bool:
         call = getattr(request, "tool_call", None) or {}
+        name = call.get("name") or ""
+        if name in OBSERVATION_TOOLS:
+            self._epoch += 1
+            return False
         try:
             args = json.dumps(call.get("args", {}), sort_keys=True, default=str)
         except (TypeError, ValueError):
             args = str(call.get("args"))
-        key = f"{call.get('name')}::{args}"
+        key = f"{self._epoch}::{name}::{args}"
         self._seen[key] = self._seen.get(key, 0) + 1
         return self._seen[key] > self.limit
 
     def _refusal(self, request) -> ToolMessage:
         call = getattr(request, "tool_call", None) or {}
+        # Not status="error": a block is not a tool failure, and marking it as one made the
+        # model apply the prompt's two-strikes "stop and tell the user" rule and give up.
+        # The content is a ladder of alternatives, because the old wording offered only
+        # "change the arguments or tell the user it failed" — and a zero-arg tool has no
+        # arguments to change, leaving surrender as the sole option on the menu.
         return ToolMessage(
             content=(
-                f"Blocked: '{call.get('name')}' was already called {self.limit} time(s) "
-                "with these exact arguments without succeeding. Change the arguments or "
-                "tell the user it failed."
+                f"Not run: '{call.get('name')}' was already tried {self.limit}x with these "
+                "exact arguments and the page has not been read since, so the result would "
+                "be the same. This is not a failure — try something else:\n"
+                "- read_page to see the page as it is NOW; the earlier map may have been "
+                "incomplete or truncated, and re-reading also re-enables this action\n"
+                '- act with {"verb":"wait"} if the page may still have been rendering\n'
+                "- a different element, or press/submit with no id to hit whatever has focus\n"
+                "- ask_user what they can see on screen"
             ),
             tool_call_id=call.get("id") or "",
             name=call.get("name") or "",
-            status="error",
         )
 
     # Both paths implemented: /chat streams via astream(), but a sync entry point
@@ -170,22 +412,104 @@ class RepeatedToolCallGuard(AgentMiddleware):
         return await handler(request)
 
 
+# The header content.js puts at the top of every element map. Finding it is how a map is
+# told apart from the outcome lines that precede it in an act result.
+MAP_HEADER = re.compile(r'^page:\s.*$', re.M)
+
+MAP_DROPPED_NOTE = "[element map removed — it was superseded by a later one]"
+
+
+class TrimSupersededMaps(AgentMiddleware):
+    """Drop stale element maps from the transcript while keeping what the actions did.
+
+    An act result has two halves with completely different shelf lives:
+
+        ok: clicked "Delete"          <- what happened. Small, and it is the agent's only
+        → the page changed (3 gone)      memory of its own work.
+
+        page: Inbox                   <- the map. Large, and worthless the moment a newer
+        12 row Mail from Ana             one arrives.
+        ...
+
+    ClearToolUsesEdit replaces a tool message wholesale, so using it here threw the first
+    half away with the second. That is what made a turn loop: three steps in, the agent
+    could no longer see that it had already clicked Delete, and the placeholder it got
+    instead told it to read the page again — so it did, saw a fresh inbox, and deleted
+    again. Approving the action changed nothing, because the evidence of it was overwritten
+    on the next model call.
+
+    Keeping the outcomes is also cheaper than the placeholder that replaced them: a couple
+    of lines per past step against a sentence of boilerplate.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.tools = []          # registers no tools of its own
+
+    @staticmethod
+    def _split(content: str) -> Optional[str]:
+        """The content with its map removed, or None if there was no map to remove."""
+        if not isinstance(content, str):
+            return None
+        found = MAP_HEADER.search(content)
+        if not found:
+            return None
+        head = content[:found.start()].rstrip()
+        return f"{head}\n\n{MAP_DROPPED_NOTE}" if head else MAP_DROPPED_NOTE
+
+    @classmethod
+    def _trim(cls, messages: list) -> list:
+        # Newest first, so "keep the current map" needs no second pass.
+        seen_map = False
+        out = []
+        for msg in reversed(messages):
+            if isinstance(msg, ToolMessage):
+                trimmed = cls._split(msg.content)
+                if trimmed is not None:
+                    if seen_map:
+                        # copy, never mutate: the message list is shared with graph state,
+                        # and editing in place would make the trim permanent.
+                        msg = msg.model_copy(update={"content": trimmed})
+                    seen_map = True
+            out.append(msg)
+        out.reverse()
+        return out
+
+    def wrap_model_call(self, request, handler):
+        return handler(request.override(messages=self._trim(request.messages)))
+
+    async def awrap_model_call(self, request, handler):
+        return await handler(request.override(messages=self._trim(request.messages)))
+
+
 # ── Cached client factories ────────────────────────────────────────────────────
 
 @lru_cache(maxsize=256)
 def get_openai_clients(token: str, model_id: str):
-    from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-    embedding = OpenAIEmbeddings(model="text-embedding-3-small", openai_api_key=token)
-    llm       = ChatOpenAI(model=model_id, openai_api_key=token, streaming=True)
-    return llm, embedding
+    from langchain_openai import ChatOpenAI
+    return ChatOpenAI(model=model_id, openai_api_key=token, streaming=True,
+                      stream_usage=True)
 
 
 @lru_cache(maxsize=256)
 def get_gemini_clients(token: str, model_id: str):
-    from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
-    embedding = GoogleGenerativeAIEmbeddings(model="gemini-embedding-001", google_api_key=token)
-    llm       = ChatGoogleGenerativeAI(model=model_id, google_api_key=token, streaming=True)
-    return llm, embedding
+    from langchain_google_genai import ChatGoogleGenerativeAI
+    return ChatGoogleGenerativeAI(model=model_id, google_api_key=token, streaming=True)
+
+
+# GroqCloud exposes an OpenAI-compatible endpoint (chat completions, streaming, tool
+# calls), so this rides langchain-openai with a different base_url instead of adding
+# another SDK. Note: Groq, the inference host — not xAI's Grok.
+@lru_cache(maxsize=256)
+def get_groq_clients(token: str, model_id: str):
+    from langchain_openai import ChatOpenAI
+    return ChatOpenAI(
+        model=model_id,
+        openai_api_key=token,
+        base_url="https://api.groq.com/openai/v1",
+        streaming=True,
+        stream_usage=True,
+    )
 
 
 @lru_cache(maxsize=256)
@@ -196,49 +520,103 @@ def get_claude_client(token: str, model_id: str):
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
-def get_top_chunks(query: str, chunks: list, embedding=None) -> str:
-    if not chunks:
-        return ""
-    if embedding:
-        doc_vectors  = embedding.embed_documents(chunks)
-        query_vector = embedding.embed_query(query)
-        scores = cosine_similarity([query_vector], doc_vectors)[0]
-    else:
-        vectorizer = TfidfVectorizer()
-        matrix     = vectorizer.fit_transform(chunks + [query])
-        scores     = cosine_similarity(matrix[-1], matrix[:-1])[0]
-    top_indices = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)[:3]
-    return "\n\n".join(chunks[i] for i, _ in top_indices)
-
-
-def _resolve_llm(provider: str, token: str, model: Optional[str], gemini_key: Optional[str] = None):
+def _resolve_llm(provider: str, token: str, model: Optional[str]):
     if provider == "openai":
-        model_id = model or "gpt-4.1-mini"
-        return get_openai_clients(token, model_id)
+        return get_openai_clients(token, model or "gpt-4.1-mini")
     if provider == "gemini":
-        model_id = model or "gemini-2.5-flash"
-        return get_gemini_clients(token, model_id)
+        return get_gemini_clients(token, model or "gemini-2.5-flash")
+    if provider == "groq":
+        return get_groq_clients(token, model or "openai/gpt-oss-120b")
     if provider == "claude":
-        model_id = model or "claude-haiku-4-5"
-        llm = get_claude_client(token, model_id)
-        if gemini_key:
-            from langchain_google_genai import GoogleGenerativeAIEmbeddings
-            embedding = GoogleGenerativeAIEmbeddings(model="gemini-embedding-001", google_api_key=gemini_key)
-            return llm, embedding
-        return llm, None
+        return get_claude_client(token, model or "claude-haiku-4-5")
     raise ValueError(f"Unsupported provider: {provider}")
 
 
-def _sse_error_handler(e: Exception, provider: str) -> str:
+# Auth failures only. Deliberately NOT a bare "invalid" match: OpenAI-compatible
+# APIs label a missing model `"type": "invalid_request_error"`, so a substring test
+# on "invalid" reports a working key as a bad one and hides the real cause.
+_AUTH_MARKERS = (
+    "invalid api key", "invalid_api_key", "incorrect api key", "invalid x-api-key",
+    "api key not valid", "no api key", "missing api key", "api_key",
+    "authentication", "unauthorized", "permission denied", "401",
+)
+
+
+def _is_auth_error(e: Exception) -> bool:
     msg = str(e).lower()
-    if any(k in msg for k in ("api key", "apikey", "authentication", "unauthorized", "invalid")):
+    return any(k in msg for k in _AUTH_MARKERS)
+
+
+# A provider's quota, kept separate from auth because the user's action is different —
+# wait or shorten, not go and check the key — and because the raw provider JSON is not a
+# sentence anyone should be shown.
+#
+# Phrases only, plus the exception's own status code. Deliberately no bare "429"/"413"/
+# "tpm": those appear inside org ids, token counts and request ids, and matching them would
+# repeat the mistake that made a missing model report itself as a bad API key.
+_RATE_MARKERS = (
+    "rate_limit_exceeded", "rate limit reached", "rate limit exceeded",
+    "too many requests", "tokens per", "requests per", "request too large",
+)
+_RATE_STATUS = frozenset({413, 429})
+
+# "Please try again in 11m7.872s" / "try again in 19.8s" — the provider knows the window,
+# so quote it rather than guessing whether the cap was per minute or per day.
+_RETRY_AFTER = re.compile(r"try again in ([0-9hms.]+)", re.I)
+# TPD and TPM are the same error shape with very different consequences for the user.
+_RATE_WINDOW = re.compile(r"tokens per (day|minute|hour)", re.I)
+
+
+def _is_rate_limit_error(e: Exception) -> bool:
+    if getattr(e, "status_code", None) in _RATE_STATUS:
+        return True
+    msg = str(e).lower()
+    return any(k in msg for k in _RATE_MARKERS)
+
+
+def _rate_limit_message(provider: str, e: Optional[Exception] = None) -> str:
+    raw    = str(e or "")
+    window = _RATE_WINDOW.search(raw)
+    retry  = _RETRY_AFTER.search(raw)
+    scope  = f"per-{window.group(1)} limit" if window else "rate limit"
+    # rstrip(".") because the duration pattern also swallows the sentence's full stop.
+    when   = (f" Try again in {retry.group(1).rstrip(chr(46))}." if retry
+              else " Wait a moment and try again.")
+    return (f"{provider.title()} hit its {scope}.{when} "
+            "A long page task in one turn is the usual cause; a paid tier or another "
+            "provider lifts it.")
+
+
+def _sse_error_handler(e: Exception, provider: str) -> str:
+    if _is_auth_error(e):
         return f"Invalid API key for {provider}. Check your key in Settings."
+    if _is_rate_limit_error(e):
+        return _rate_limit_message(provider, e)
     return f"Stream error ({provider}): {e}"
 
 
 # ── Page context: what the server knows about the page it is acting on ────────
-# Mirrors the snapshot format content.js emits, e.g.  [15] button "Delete account"
-SNAPSHOT_LINE = re.compile(r'^\[(\d+)\]\s+(\S+)(?:\s+"([^"]*)")?')
+# Mirrors the snapshot format content.js emits, e.g.
+#   15 button Delete account
+#   12 textbox Search = laptops [required]
+#   30 combobox Country options: India | Japan
+# The name is unquoted, so it is read as "everything after the role, minus the suffixes".
+# content.js's clean() strips "[", "]" and " = " out of names and values precisely so
+# these suffix patterns cannot match inside one. Keep the three in step: this parser, the
+# panel's SNAP_LINE, and describe().
+SNAPSHOT_LINE = re.compile(r'^(\d+)\s+(\S+)(?:\s+(.*))?$')
+_SNAP_SUFFIXES = (
+    re.compile(r'\s+options:\s.*$'),     # <select> choices, appended last
+    re.compile(r'\s+\[[^\]]*\]$'),        # state flags
+    re.compile(r'\s+=\s.*$'),            # current value
+)
+
+
+def _snapshot_name(rest: str) -> str:
+    """Strip the value/flags/options suffixes, leaving the element's name."""
+    for pattern in _SNAP_SUFFIXES:
+        rest = pattern.sub("", rest)
+    return rest.strip()
 
 
 def _snapshot_elements(text: str) -> dict:
@@ -247,7 +625,7 @@ def _snapshot_elements(text: str) -> dict:
     for line in (text or "").splitlines():
         m = SNAPSHOT_LINE.match(line)
         if m:
-            found[int(m.group(1))] = (m.group(2), m.group(3) or "")
+            found[int(m.group(1))] = (m.group(2), _snapshot_name(m.group(3) or ""))
     return found
 
 
@@ -355,7 +733,9 @@ class PageContext:
 # Everything here is read-only or already gated by its own rules; anything else reaching the
 # agent is an external side effect (Composio) and asks in both modes by default.
 SAFE_TOOL_NAMES = frozenset({
-    "search_page", "summarize_page", "read_page", "act", "ask_user",
+    "read_text", "read_page", "act", "ask_user",
+    # Retrieval reads the page and nothing else; escalate only re-dispatches this turn.
+    "search_page", "summarize_page", "escalate",
     # goto is here deliberately: navigation is reversible with Back, and everything
     # consequential at the destination is already gated by needs_approval. Prompting on
     # "go to google" would only train the user to approve without reading.
@@ -369,13 +749,18 @@ def _hitl_config(mode: str, tool_names: list, ctx: "PageContext") -> dict:
     Unrestricted covers page actions only. External side effects still ask either way — a
     wrong click is undone with Back, a sent email is not.
     """
-    cfg: dict = {
-        # Asking the user for information is not a restriction, it is the agent doing its
-        # job, so it stays on in both modes.
-        "ask_user": {"allowed_decisions": ["respond"]},
-    }
+    have = set(tool_names)
+    cfg: dict = {}
 
-    if mode != "unrestricted":
+    # Asking the user for information is not a restriction, it is the agent doing its job,
+    # so it stays on in both modes.
+    if "ask_user" in have:
+        cfg["ask_user"] = {"allowed_decisions": ["respond"]}
+
+    # Only ever configure gates for tools this lane actually holds: a lane without `act`
+    # has nothing to approve, and a config naming absent tools invites the reader to think
+    # the gate is doing something it cannot.
+    if mode != "unrestricted" and "act" in have:
         cfg["act"] = {
             "allowed_decisions": ["approve", "reject"],
             "when":              ctx.needs_approval,
@@ -389,17 +774,205 @@ def _hitl_config(mode: str, tool_names: list, ctx: "PageContext") -> dict:
     return cfg
 
 
+# ── Page text and retrieval ───────────────────────────────────────────────────
+# Retrieval runs here, not in the model's context: search_page returns the passages that
+# match, so a question about a long page costs a few hundred tokens instead of the whole
+# page. TF-IDF is the default because it needs no embedding endpoint at all — Groq has
+# none, and it is the cheapest thing that works everywhere.
+
+CHUNK_SIZE      = 500
+CHUNK_OVERLAP   = 50
+TOP_CHUNKS      = 5
+MAX_TEXT_CHARS  = 8000     # one read_text; ~2k tokens, sized to leave room under a TPM cap
+MAX_SUMMARY_CHARS = 12000  # a summary genuinely needs the whole page, so it gets more
+
+
+@lru_cache(maxsize=64)
+def _resolve_embedding(provider: str, token: str):
+    """An embedding model for the selected provider, or None when it has none.
+
+    Groq and Anthropic ship no embeddings endpoint, so those return None and retrieval
+    falls back to TF-IDF rather than failing.
+    """
+    try:
+        if provider == "openai":
+            from langchain_openai import OpenAIEmbeddings
+            return OpenAIEmbeddings(model="text-embedding-3-small", openai_api_key=token)
+        if provider == "gemini":
+            from langchain_google_genai import GoogleGenerativeAIEmbeddings
+            return GoogleGenerativeAIEmbeddings(model="models/text-embedding-004",
+                                                google_api_key=token)
+    except Exception:
+        return None
+    return None
+
+
+def _rank_chunks(query: str, chunks: list, embedding=None, k: int = TOP_CHUNKS) -> str:
+    """Top-k chunks for the query. Synchronous and CPU-bound — call in a threadpool."""
+    if not chunks:
+        return ""
+    from sklearn.metrics.pairwise import cosine_similarity
+
+    scores = None
+    if embedding is not None:
+        try:
+            doc_vectors  = embedding.embed_documents(chunks)
+            query_vector = embedding.embed_query(query)
+            scores = cosine_similarity([query_vector], doc_vectors)[0]
+        except Exception:
+            scores = None      # a paid embedding call must never lose the answer
+    if scores is None:
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        try:
+            matrix = TfidfVectorizer().fit_transform(chunks + [query])
+            scores = cosine_similarity(matrix[-1], matrix[:-1])[0]
+        except ValueError:
+            # Every term was a stop word, so there is nothing to rank on. Returning the
+            # head of the page beats returning nothing.
+            return "\n\n".join(chunks[:k])
+
+    ranked = sorted(range(len(chunks)), key=lambda i: scores[i], reverse=True)[:k]
+    # Document order, not score order: passages read as prose when they stay in sequence.
+    return "\n\n".join(chunks[i] for i in sorted(ranked))
+
+
+class PageText:
+    """The page's visible text, fetched at most once per turn and then chunked.
+
+    Fetched lazily rather than up front because most turns never ask for it, and because
+    over a socket the text has to come from the live page — grabbing it at send time would
+    describe wherever the tab used to be.
+    """
+
+    def __init__(self, fetch=None, fallback: str = "") -> None:
+        self._fetch    = fetch        # awaitable client_call; socket transport only
+        self._fallback = fallback     # send-time text; POST transport
+        self._text: Optional[str]     = None
+        self._chunks: Optional[list]  = None
+
+    async def text(self) -> str:
+        if self._text is None:
+            if self._fetch is not None:
+                try:
+                    self._text = str(await self._fetch("read_text", {}) or "").strip()
+                except Exception:
+                    self._text = ""
+            else:
+                self._text = (self._fallback or "").strip()
+        return self._text
+
+    async def chunks(self) -> list:
+        if self._chunks is None:
+            from langchain_text_splitters import RecursiveCharacterTextSplitter
+            body = await self.text()
+            splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE,
+                                                      chunk_overlap=CHUNK_OVERLAP)
+            self._chunks = splitter.split_text(body) if body else []
+        return self._chunks
+
+
+class Escalation:
+    """Records a lane's request to hand the turn to the page tools.
+
+    The tool cannot re-dispatch the graph itself, so it parks the reason here and the
+    transport re-runs the turn in the operate lane once. One instance per turn, and the
+    single hop is enforced by the transport, not by trusting the model to stop asking.
+    """
+
+    def __init__(self) -> None:
+        self.reason: Optional[str] = None
+
+    @property
+    def requested(self) -> bool:
+        return self.reason is not None
+
+
+# ── Intent router ─────────────────────────────────────────────────────────────
+# One structured-output call per turn picks the lane. It is deliberately tiny — it sees
+# the lane descriptions and the last exchange, never the tool schemas — which is what
+# makes it ~100 tokens instead of the ~1.8k a tool-selection pass would cost, and it runs
+# once per turn rather than once per model call.
+
+ROUTER_TIMEOUT = 20
+
+
+def _route_instructions(lanes: list[str]) -> str:
+    """The routing rule, written from the registry so it cannot drift from LANES."""
+    lines = [f"- {name}: {LANES[name].description}" for name in lanes]
+    return (
+        "Classify what the user wants so it can be handled by the right tools. "
+        "Choose exactly one option.\n\n" + "\n".join(lines) + "\n\n"
+        "Judge the request on its own. If it asks for something to be done rather than "
+        "answered, choose the option that does things."
+    )
+
+
+def _router_input(query: str) -> str:
+    """The user turn shown to the router: the request, verbatim.
+
+    No prior conversation (see _build_messages) and deliberately no page context either.
+    Telling the router which page the user is on reads as an instruction to act on it: with
+    the page named, "what does this page say about his goals" and even "hi" were classified
+    as work to do. The bare request scores 14/15 on the case set; adding context scored 4/6
+    and then 2/8. The remaining miss is recovered by escalate.
+    """
+    return query
+
+
+async def _route(llm, body: "ChatRequest", allow_browser: bool,
+                 usage: Optional["Usage"] = None) -> tuple[str, Optional[str]]:
+    """Pick a lane. Returns (lane, error) — error is set only for reporting, never fatal.
+
+    Failure falls back to the most capable available lane, so a router that cannot parse
+    leaves the turn behaving exactly as the old single-agent design did instead of
+    answering with fewer tools than the task needs.
+    """
+    from typing import Literal
+    from pydantic import Field, create_model
+
+    available = [n for n in LANES if allow_browser or not LANES[n].needs_browser]
+    fallback  = FALLBACK_LANE if FALLBACK_LANE in available else LANE_ASK_PAGE
+    if len(available) < 2:
+        return fallback, None
+
+    # Built from the registry so a new lane needs no change here.
+    Route = create_model(
+        "Route",
+        lane=(Literal[tuple(available)],
+              Field(description="which option handles the user's latest message")),
+    )
+
+    try:
+        async with asyncio.timeout(ROUTER_TIMEOUT):
+            # include_raw so the routing call's own tokens land in the turn's total. A
+            # counter that hid the router would understate every turn by its cheapest part.
+            got = await llm.with_structured_output(Route, include_raw=True).ainvoke([
+                ("system", _route_instructions(available)),
+                ("user",   _router_input(body.query)),
+            ])
+        raw    = (got or {}).get("raw")
+        picked = (got or {}).get("parsed")
+        if usage is not None and getattr(raw, "usage_metadata", None):
+            usage.observe(getattr(raw, "id", None), raw.usage_metadata)
+        lane = getattr(picked, "lane", None)
+        if lane in available:
+            return lane, None
+        return fallback, f"router returned {lane!r}"
+    except Exception as e:
+        return fallback, f"{type(e).__name__}: {e}"
+
+
 # ── Agent assembly, shared by both transports ─────────────────────────────────
 
-def _chunk_page(text: str) -> list:
-    if not text.strip():
-        return []
-    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-    return splitter.split_text(text)
+def _build_tools(body: "ChatRequest", client_call=None, lane: str = LANE_OPERATE,
+                 page_text: Optional["PageText"] = None,
+                 escalation: Optional["Escalation"] = None,
+                 provider: str = "", token: str = "") -> list:
+    """Assemble the tool list for one lane.
 
-
-def _build_tools(body: "ChatRequest", embedding, chunks: list, client_call=None) -> list:
-    """Assemble the tool list.
+    Every candidate tool is defined here and then filtered through CAPABILITIES, so a
+    lane's tool list — and therefore its prompt and its token cost — follows from the
+    registry rather than from a branch per lane.
 
     `client_call(name, args)` is an awaitable that runs a tool *in the browser* and
     returns its result. It is only available over the WebSocket transport, because a
@@ -408,37 +981,9 @@ def _build_tools(body: "ChatRequest", embedding, chunks: list, client_call=None)
     cannot use.
     """
 
-    @tool
-    def search_page(query: str) -> str:
-        """Find specific information in the current page's text.
+    tools     = []
+    page_text = page_text or PageText(fallback=getattr(body, "text", "") or "")
 
-        Use this for any question about what the page says — facts, details, what it
-        covers on a topic. Returns only the passages relevant to the query."""
-        if not chunks:
-            return "No page content available."
-        try:
-            return get_top_chunks(query, chunks, embedding)
-        except Exception:
-            return get_top_chunks(query, chunks, None)
-
-    @tool
-    def summarize_page() -> str:
-        """Return the page's entire text.
-
-        Use only when the user explicitly asks for a summary, an overview, or the full
-        contents. This returns a lot of text — for a specific question about the page,
-        use search_page instead."""
-        if not body.text.strip():
-            return "No page content available."
-        max_chars = 15000
-        text = body.text.strip()
-        if len(text) > max_chars:
-            return text[:max_chars] + "\n\n[Content truncated — page is very long]"
-        return text
-
-    tools = [search_page, summarize_page]
-
-    # ── read_page: live over a socket, otherwise the snapshot sent with the request ──
     if client_call is None:
         @tool
         def read_page() -> str:
@@ -448,8 +993,7 @@ def _build_tools(body: "ChatRequest", embedding, chunks: list, client_call=None)
             a field already has a value).
 
             Use this when the user asks what is on the page, what they can do here, or wants to
-            interact with a control. To read the page's TEXT instead, use search_page or
-            summarize_page."""
+            interact with a control."""
             if not body.snapshot.strip():
                 return (
                     "No element map available for this page. It may be a browser-internal page, "
@@ -466,10 +1010,27 @@ def _build_tools(body: "ChatRequest", embedding, chunks: list, client_call=None)
 
             Element numbers are only valid until the page changes. act and goto return an
             updated map themselves, so you do not need to call this after them — only call it
-            again if that map looks empty or is missing something you expected.
-
-            To read the page's TEXT instead, use search_page or summarize_page."""
+            again if that map looks empty or is missing something you expected."""
             return await client_call("read_page", {})
+
+        # Fetched when the tool runs, never captured up front: goto and act move the page
+        # mid-turn, so send-time text describes wherever the agent used to be. The cap
+        # lives at module scope beside the retrieval sizes it has to stay in step with.
+
+        @tool
+        async def read_text() -> str:
+            """Read the current page's visible text.
+
+            Use this to answer any question about what a page says — its content, facts,
+            details, what an article covers. For the page's buttons and inputs, so you can
+            act on them, use read_page instead."""
+            text = (await client_call("read_text", {}) or "").strip()
+            if not text:
+                return ("No text on this page. It may be a browser-internal page, or it may "
+                        "not have finished loading.")
+            if len(text) > MAX_TEXT_CHARS:
+                return text[:MAX_TEXT_CHARS] + "\n\n[Truncated — the page is very long]"
+            return text
 
         @tool
         async def act(actions: list[dict]) -> str:
@@ -488,6 +1049,17 @@ def _build_tools(body: "ChatRequest", embedding, chunks: list, client_call=None)
               scroll  {"verb":"scroll","direction":"down"}        — or "up"/"top"/"bottom"
               submit  {"verb":"submit","id":19}
               wait    {"verb":"wait"}
+              back    {"verb":"back"}      — browser Back, to return to a list you came from
+              forward {"verb":"forward"}
+
+            press, submit, scroll, wait, back and forward also work with NO id, acting on
+            whatever has focus. That is your way in when a control is on screen but missing from the
+            map — a dialog normally focuses its input as it opens, so a bare press can
+            type into something you cannot address by number.
+
+            wait on its own — act with [{"verb":"wait"}] — settles the page and returns a
+            fresh map. Use it when a map looks incomplete, before assuming anything is
+            missing.
 
             Actions run in order and STOP after the first click, press or submit, because
             those change the page and every id after them may be stale. Group your fills
@@ -503,6 +1075,11 @@ def _build_tools(body: "ChatRequest", embedding, chunks: list, client_call=None)
         def ask_user(question: str, kind: str = "text", options: Optional[list] = None) -> str:
             """Ask the user for something you need before you can continue: a value for a
             form field, a choice between paths, a detail only they know.
+
+            Also use it when you are stuck — the page is not behaving as expected, or a
+            control you need is not in the element map. They are looking at the screen and
+            you are not. "I clicked X but I cannot see a text box — what do you see?" keeps
+            the task alive where reporting failure ends it.
 
             Prefer this over guessing, and over ending your turn to ask in prose — this
             keeps the task running, and their answer comes straight back to you.
@@ -527,11 +1104,60 @@ def _build_tools(body: "ChatRequest", embedding, chunks: list, client_call=None)
             """
             return await client_call("goto", {"url": url})
 
+        tools.append(read_text)
         tools.append(act)
         tools.append(ask_user)
         tools.append(goto)
 
     tools.append(read_page)
+
+    # ── Retrieval over the page's text ────────────────────────────────────────
+    embedding = _resolve_embedding(provider, token) if token else None
+
+    @tool
+    async def search_page(query: str) -> str:
+        """Search the current page for the passages relevant to a query.
+
+        Use this to answer any question about what the page says. Returns the matching
+        passages, not the whole page, so call it again with different wording if the
+        first result does not contain the answer."""
+        chunks = await page_text.chunks()
+        if not chunks:
+            return ("No text on this page. It may be a browser-internal page, or it may "
+                    "not have finished loading.")
+        # sklearn is synchronous and CPU-bound; off the event loop so a long page cannot
+        # stall the socket that is streaming this turn.
+        found = await run_in_threadpool(_rank_chunks, query, chunks, embedding)
+        return found or "Nothing on this page matched that."
+
+    @tool
+    async def summarize_page() -> str:
+        """Return the page's full visible text, for a summary or an overview.
+
+        Use this when the user wants the whole page rather than one detail from it."""
+        body_text = await page_text.text()
+        if not body_text:
+            return ("No text on this page. It may be a browser-internal page, or it may "
+                    "not have finished loading.")
+        if len(body_text) > MAX_SUMMARY_CHARS:
+            return body_text[:MAX_SUMMARY_CHARS] + "\n\n[Truncated — the page is very long]"
+        return body_text
+
+    tools.append(search_page)
+    tools.append(summarize_page)
+
+    # ── Handing a turn to the page tools ──────────────────────────────────────
+    if escalation is not None:
+        @tool
+        def escalate(reason: str) -> str:
+            """Hand this request to the page-action tools, which can click, type and
+            navigate. Call it as soon as the request needs one of those, with a one-line
+            reason, and then stop."""
+            escalation.reason = reason or "the request needs page actions"
+            return ("Handed to the page tools. Stop here and add nothing further — the "
+                    "task continues there.")
+
+        tools.append(escalate)
 
     composio_key = (body.tool_keys or {}).get("composio")
     if composio_key:
@@ -541,13 +1167,19 @@ def _build_tools(body: "ChatRequest", embedding, chunks: list, client_call=None)
         session = composio.create(user_id="default")
         tools.extend(session.tools())
 
-    return tools
+    # The registry, not a branch per lane, decides what this turn is allowed to hold.
+    return [t for t in tools if lane in _cap(getattr(t, "name", "")).lanes]
 
 
-def _build_agent(llm, tools: list, interrupt_on: Optional[dict] = None, checkpointer=None):
+def _build_agent(llm, tools: list, lane: str = LANE_OPERATE,
+                 interrupt_on: Optional[dict] = None, checkpointer=None,
+                 page_hint: str = ""):
     """create_agent (langchain>=1) over langgraph's create_react_agent: the same
     tool-calling loop, but it accepts middleware. Order matters — first listed is
     outermost, so the call limits sit outside everything and cannot be bypassed.
+
+    The system prompt is composed from `lane` and the tools actually passed in, so a lane
+    never carries instructions for tools it does not have.
 
     `interrupt_on`/`checkpointer` are supplied only by the socket transport. Interrupts
     require checkpointing, and a POST has no way to ask a human anyway, so it passes
@@ -568,30 +1200,43 @@ def _build_agent(llm, tools: list, interrupt_on: Optional[dict] = None, checkpoi
 
     middleware += [
         ToolErrorMiddleware(_on_tool_error),
-        # Drops superseded tool output once the window fills, keeping only the last
-        # few results. Matters most once page snapshots arrive on every step.
-        ContextEditingMiddleware(edits=[ClearToolUsesEdit(trigger=100_000, keep=3)]),
+        # Where the tokens actually are: the ReAct loop re-sends the whole transcript on
+        # every model call, so k element maps cost O(k^2). This drops every map but the
+        # current one on every call — unconditionally, with no trigger to cross — while
+        # keeping the outcome lines that tell the agent what it has already done.
+        TrimSupersededMaps(),
+        # Backstop for page *text*, which has no separable outcome line and so can only be
+        # cleared wholesale. High trigger: a summary or a quote may legitimately need text
+        # from several steps back, and unlike a stale map it does not go wrong with age.
+        ContextEditingMiddleware(edits=[
+            ClearToolUsesEdit(trigger=TEXT_CLEAR_TRIGGER, keep=2),
+        ]),
     ]
 
     return create_agent(
         model=llm,
         tools=tools,
-        system_prompt=SYSTEM_PROMPT,
+        system_prompt=_lane_prompt(tools, page_hint),
         middleware=middleware,
         checkpointer=checkpointer,
     )
 
 
-def _build_messages(history, query: str) -> list:
-    from langchain_core.messages import HumanMessage, AIMessage
-    messages = []
-    for h in (history or []):
-        if h.get("role") == "user":
-            messages.append(HumanMessage(content=h["content"]))
-        elif h.get("role") == "assistant":
-            messages.append(AIMessage(content=h["content"]))
-    messages.append(HumanMessage(content=query))
-    return messages
+def _build_messages(query: str) -> list:
+    """The turn's messages: the request, and nothing before it.
+
+    This is a task runner, not a chat. "Open wikipedia, search ronaldo and tell me about
+    him" is a whole job on its own, and it completes inside one turn — the tool loop, the
+    element maps, ask_user and the approvals all live there. Prose from *earlier* turns
+    would only add cost (it was billed again on every model call of the loop, unbounded,
+    because the old cap counted messages rather than tokens) and offer the model context
+    from a page it may no longer be on.
+
+    The trade is deliberate: a follow-up like "now the next one" has nothing to refer to,
+    so a request has to say what it wants.
+    """
+    from langchain_core.messages import HumanMessage
+    return [HumanMessage(content=query)]
 
 
 def _flatten(content) -> str:
@@ -603,6 +1248,54 @@ def _flatten(content) -> str:
     return content if isinstance(content, str) else ""
 
 
+class Usage:
+    """Token total for one turn, across every model call it makes.
+
+    Kept per model call and combined with max(), never by summing what arrives. That is
+    not defensive style, it is required: Groq emits its usage block twice in a stream, and
+    langchain's chunk aggregation adds the two, so a summing counter reports exactly double
+    (334 where the API charged 167). Input tokens are a property of a request, not a
+    quantity that accumulates within one, so the largest value seen for a call is the true
+    one whether the provider reports it once, twice, or incrementally.
+
+    Keyed on the message id, which every chunk of a single completion shares.
+    """
+
+    def __init__(self) -> None:
+        self._calls: dict[str, tuple[int, int]] = {}
+        self._anon = 0
+
+    def observe(self, call_id: Optional[str], meta) -> None:
+        if not isinstance(meta, dict):
+            return
+        got = (int(meta.get("input_tokens") or 0), int(meta.get("output_tokens") or 0))
+        if not call_id:
+            # No id to key on — count it as its own call rather than merging it into
+            # another and under-reporting.
+            self._anon += 1
+            call_id = f"anon{self._anon}"
+        have = self._calls.get(call_id, (0, 0))
+        self._calls[call_id] = (max(have[0], got[0]), max(have[1], got[1]))
+
+    @property
+    def input(self) -> int:
+        return sum(i for i, _ in self._calls.values())
+
+    @property
+    def output(self) -> int:
+        return sum(o for _, o in self._calls.values())
+
+    @property
+    def calls(self) -> int:
+        return len(self._calls)
+
+    def frame(self) -> dict:
+        return {"usage": {"input":  self.input,
+                          "output": self.output,
+                          "total":  self.input + self.output,
+                          "calls":  self.calls}}
+
+
 async def _stream_agent(
     agent,
     messages: list,
@@ -610,6 +1303,8 @@ async def _stream_agent(
     provider: str,
     config: Optional[dict] = None,
     on_interrupt=None,
+    usage: Optional["Usage"] = None,
+    emit_usage: bool = True,
 ):
     """Yield frames as plain dicts, so /chat can wrap them as SSE and /chat/ws can send
     them as JSON without either transport inventing its own vocabulary.
@@ -654,6 +1349,8 @@ async def _stream_agent(
                         msg, metadata = data
                         if metadata.get("langgraph_node") == "tools":
                             continue
+                        if usage is not None and getattr(msg, "usage_metadata", None):
+                            usage.observe(getattr(msg, "id", None), msg.usage_metadata)
                         text = _flatten(getattr(msg, "content", None))
                         if text:
                             yield {"text": text}
@@ -719,7 +1416,47 @@ async def _stream_agent(
     except Exception as e:
         yield {"error": _sse_error_handler(e, provider)}
     finally:
+        if emit_usage and usage is not None and usage.calls:
+            yield usage.frame()
         yield {"done": True}
+
+
+async def _stream_chat(llm, messages: list, timeout: int, provider: str,
+                       usage: Optional["Usage"] = None, emit_usage: bool = True):
+    """The chat lane: stream the model with no tools at all.
+
+    Not an agent with an empty tool list — a plain model call. That is both the cheapest
+    turn the server can serve and the reason a conversational message can never trip an
+    approval prompt or a page action: there is nothing there to trip.
+    """
+    yield {"status": "started"}
+    try:
+        async with asyncio.timeout(timeout):
+            async for chunk in llm.astream([("system", PROMPT_BASE), *messages]):
+                text = _flatten(getattr(chunk, "content", None))
+                if text:
+                    yield {"text": text}
+                if usage is not None and getattr(chunk, "usage_metadata", None):
+                    usage.observe(getattr(chunk, "id", None), chunk.usage_metadata)
+    except TimeoutError:
+        yield {"error": f"LLM timed out after {timeout}s."}
+    except Exception as e:
+        yield {"error": _sse_error_handler(e, provider)}
+    finally:
+        if emit_usage and usage is not None and usage.calls:
+            yield usage.frame()
+        yield {"done": True}
+
+
+async def _with_route(lane: str, frames):
+    """Announce the lane before the turn starts.
+
+    Worth a frame of its own: when a turn behaves oddly the first question is always
+    which lane took it, and guessing from the tool calls is how misroutes stay invisible.
+    """
+    yield {"route": lane}
+    async for frame in frames:
+        yield frame
 
 
 async def _sse(frames):
@@ -735,17 +1472,22 @@ async def _sse(frames):
 
 class ChatRequest(BaseModel):
     query:      str
-    text:       str                  = ""
-    # Numbered element map built by content.js. Separate from `text` on purpose: `text` is
-    # prose for answering questions, `snapshot` is the addressing scheme for acting.
+    # Numbered element map built by content.js, captured at send time. Only the POST
+    # fallback reads it — over a socket read_page fetches a live one instead. It also
+    # seeds the generation that content.js checks before it will act.
     snapshot:   str                  = ""
+    # The page's visible text at send time. Only the POST fallback uses it — over a socket
+    # PageText fetches the live text instead, since goto and act move the page mid-turn.
+    text:       str                  = ""
     # "restricted" (default) asks before consequential page actions; "unrestricted" runs
     # them without asking. External side effects ask in either mode. Session-scoped in the
     # panel, so it is never remembered across reopens.
     mode:       str                  = "restricted"
     model:      Optional[str]        = None
+    # Accepted and ignored: turns are independent, see _build_messages. Kept on the schema
+    # so a panel build that still sends it does not fail validation, and so restoring
+    # conversational turns is a one-line change rather than a protocol change.
     history:    Optional[list[dict]] = None
-    gemini_key: Optional[str]        = None
     tool_keys:  Optional[dict]       = None
 
 
@@ -765,19 +1507,32 @@ async def chat(
         raise HTTPException(status_code=400, detail="No API key provided. Open Settings and add your key.")
 
     try:
-        llm, embedding = _resolve_llm(provider, token, body.model, body.gemini_key)
+        llm = _resolve_llm(provider, token, body.model)
     except Exception as e:
-        msg = str(e).lower()
-        if any(k in msg for k in ("api key", "apikey", "authentication", "unauthorized", "invalid")):
+        if _is_auth_error(e):
             raise HTTPException(status_code=401, detail=f"Invalid API key for {provider}. Check your key in Settings.")
         raise HTTPException(status_code=500, detail=f"Server error ({provider}): {e}")
 
-    agent = _build_agent(llm, _build_tools(body, embedding, _chunk_page(body.text)))
+    # No client_call over a POST, so the operate lane is unreachable here and the router
+    # is not offered it. Page questions still work: PageText falls back to the send-time
+    # text the panel included.
+    usage      = Usage()
+    lane, _err = await _route(llm, body, allow_browser=False, usage=usage)
+    tools      = _build_tools(body, None, lane, provider=provider, token=token)
+    messages   = _build_messages(body.query)
 
-    return StreamingResponse(
-        _sse(_stream_agent(agent, _build_messages(body.history, body.query), LLM_TIMEOUT, provider)),
-        media_type="text/event-stream",
-    )
+    # No escalation on this transport. It would need a second pass mid-stream, and the
+    # only lane worth escalating *to* — operate — is unavailable here anyway. The cost is
+    # that a turn the router sends to `chat` cannot reach the page even if it turns out to
+    # need it; the socket transport, which the panel prefers, has the hop.
+    if not tools:
+        frames = _stream_chat(llm, messages, LLM_TIMEOUT, provider, usage=usage)
+    else:
+        agent  = _build_agent(llm, tools, lane,
+                              page_hint=_page_hint(body.snapshot))
+        frames = _stream_agent(agent, messages, LLM_TIMEOUT, provider, usage=usage)
+
+    return StreamingResponse(_sse(_with_route(lane, frames)), media_type="text/event-stream")
 
 
 # ── /chat/ws endpoint ─────────────────────────────────────────────────────────
@@ -821,11 +1576,10 @@ async def chat_ws(ws: WebSocket):
         return
 
     try:
-        llm, embedding = _resolve_llm(provider, token, body.model, body.gemini_key)
+        llm = _resolve_llm(provider, token, body.model)
     except Exception as e:
-        msg = str(e).lower()
         detail = (f"Invalid API key for {provider}. Check your key in Settings."
-                  if any(k in msg for k in ("api key", "apikey", "authentication", "unauthorized", "invalid"))
+                  if _is_auth_error(e)
                   else f"Server error ({provider}): {e}")
         await ws.send_json({"error": detail})
         await ws.send_json({"done": True})
@@ -917,21 +1671,62 @@ async def chat_ws(ws: WebSocket):
     reader = asyncio.create_task(pump())
 
     try:
-        tools = _build_tools(body, embedding, _chunk_page(body.text), client_call)
-        agent = _build_agent(
-            llm, tools,
-            interrupt_on=_hitl_config(body.mode, [t.name for t in tools], page),
-            # Interrupts need checkpointing. In-memory is right here and not a compromise:
-            # the run lives and dies with this connection, which pins it to one worker, so
-            # nothing has to be shared across processes.
-            checkpointer=InMemorySaver(),
-        )
-        async for frame in _stream_agent(
-            agent, _build_messages(body.history, body.query), WS_TIMEOUT, provider,
-            config={"configurable": {"thread_id": uuid.uuid4().hex}},
-            on_interrupt=on_interrupt,
-        ):
-            await ws.send_json(frame)
+        # Page text is fetched by the tools that need it, once per turn, and never up
+        # front: over a socket goto and act move the page mid-turn, so send-time text
+        # would describe wherever the tab used to be.
+        page_text = PageText(fetch=client_call)
+        usage     = Usage()
+        messages  = _build_messages(body.query)
+
+        lane, _err = await _route(llm, body, allow_browser=True, usage=usage)
+
+        # One hop only, and it is the transport that enforces it: the second pass is built
+        # without an Escalation, so the operate lane has no escalate tool to call and the
+        # handoff cannot become a loop.
+        for hop in range(2):
+            escalation = Escalation() if (hop == 0 and lane in ESCALATING_LANES) else None
+            tools = _build_tools(body, client_call, lane, page_text=page_text,
+                                 escalation=escalation, provider=provider, token=token)
+
+            await ws.send_json({"route": lane})
+
+            if not tools:
+                frames = _stream_chat(llm, messages, WS_TIMEOUT, provider,
+                                      usage=usage, emit_usage=False)
+            else:
+                agent = _build_agent(
+                    llm, tools, lane,
+                    interrupt_on=_hitl_config(body.mode, [t.name for t in tools], page),
+                    page_hint=_page_hint(body.snapshot),
+                    # Interrupts need checkpointing. In-memory is right here and not a
+                    # compromise: the run lives and dies with this connection, which pins
+                    # it to one worker, so nothing has to be shared across processes.
+                    checkpointer=InMemorySaver(),
+                )
+                frames = _stream_agent(
+                    agent, messages, WS_TIMEOUT, provider,
+                    config={"configurable": {"thread_id": uuid.uuid4().hex}},
+                    on_interrupt=on_interrupt,
+                    usage=usage,
+                    # A turn may run two passes, so end-of-turn belongs to the transport,
+                    # not to either pass.
+                    emit_usage=False,
+                )
+
+            async for frame in frames:
+                if frame.get("done"):
+                    continue
+                await ws.send_json(frame)
+
+            if escalation is None or not escalation.requested:
+                break
+            lane = LANE_OPERATE
+
+        # One total for the whole turn, both passes included, and always before `done` —
+        # the panel stops reading at `done`.
+        if usage.calls:
+            await ws.send_json(usage.frame())
+        await ws.send_json({"done": True})
     except WebSocketDisconnect:
         pass
     except Exception as e:
