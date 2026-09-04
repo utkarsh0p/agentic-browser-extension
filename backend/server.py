@@ -579,11 +579,11 @@ def get_claude_client(token: str, model_id: str):
 # that cannot read the element map does not fail cleanly, it loops until the user gives up.
 def _resolve_llm(provider: str, token: str, model: Optional[str]):
     if provider == "openai":
-        return get_openai_clients(token, model or "gpt-5.6-sol")
+        return get_openai_clients(token, model or "gpt-6-astra")
     if provider == "gemini":
-        return get_gemini_clients(token, model or "gemini-3.7-flash")
+        return get_gemini_clients(token, model or "gemini-3.8-flash")
     if provider == "groq":
-        return get_groq_clients(token, model or "qwen/qwen3.6-27b")
+        return get_groq_clients(token, model or "qwen/qwen3.8-27b")
     if provider == "claude":
         return get_claude_client(token, model or "claude-opus-5")
     raise ValueError(f"Unsupported provider: {provider}")
@@ -1557,14 +1557,31 @@ class ChatRequest(BaseModel):
     # PageText fetches the live text instead, since goto and act move the page mid-turn.
     text:       str                  = ""
     # "restricted" (default) asks before consequential page actions; "unrestricted" runs
-    # them without asking. External side effects ask in either mode. Session-scoped in the
-    # panel, so it is never remembered across reopens.
+    # them without asking. It lifts the gate on page actions only — a tool outside
+    # SAFE_TOOL_NAMES still asks in both modes. Session-scoped in the panel, so it is never
+    # remembered across reopens.
     mode:       str                  = "restricted"
     model:      Optional[str]        = None
     # Accepted and ignored: turns are independent, see _build_messages. Kept on the schema
     # so a panel build that still sends it does not fail validation, and so restoring
     # conversational turns is a one-line change rather than a protocol change.
     history:    Optional[list[dict]] = None
+
+
+@app.get("/health")
+async def health():
+    """Liveness, and the panel's wake-up call.
+
+    Deliberately does no work: the panel fires this the moment it opens so a host that spins
+    down when idle does its cold start while the user is still typing, rather than inside the
+    WebSocket connect budget — where the wait was being read as "this backend has no socket"
+    and silently downgrading the turn to a transport that cannot act on the page.
+
+    It also sizes that budget. A backend that answered here and then fails to upgrade really
+    is a backend without /chat/ws, not a sleeping one, so the panel can give up quickly
+    instead of guessing.
+    """
+    return {"ok": True}
 
 
 @app.post("/chat")
