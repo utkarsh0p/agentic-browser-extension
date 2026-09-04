@@ -1463,6 +1463,38 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
+  // ── Tips ──────────────────────────────────────────────────────────────────
+
+  // Things that look like bugs but are not: a throttled free key, a model too weak to
+  // drive the page, a turn that does not remember the last one. Each costs a new user a
+  // bad first impression that one sentence prevents. Groups are data so adding a tip is
+  // an array entry, not new markup.
+  const TIPS = [
+    { label: 'Speed', lines: [
+      'A free API key is rate-limited, so replies are slow and page actions may not finish. A paid key is much faster.',
+      'The first request after a quiet spell wakes the server and can take up to 30 seconds.',
+    ]},
+    { label: 'Models', lines: [
+      'Cheaper models struggle with clicking and typing. For anything beyond questions, use Claude or Gemini.',
+    ]},
+    { label: 'How it behaves', lines: [
+      'Each message stands on its own — it doesn’t remember the last one, so say the whole task in one go.',
+      'It works in the tab you opened it from, and can’t switch tabs.',
+      'Restricted mode asks before risky clicks, and resets every time you reopen the panel.',
+    ]},
+  ];
+
+  function renderTipsScreen() {
+    const wrap = document.createElement('div');
+    wrap.className = 'tips';
+    wrap.innerHTML = TIPS.map(group => `
+      <div class="tip-group">
+        <p class="about-label">${escHtml(group.label)}</p>
+        ${group.lines.map(line => `<p class="tip-line">${escHtml(line)}</p>`).join('')}
+      </div>`).join('');
+    overlayList.appendChild(wrap);
+  }
+
   // ── About ─────────────────────────────────────────────────────────────────
 
   // The version is read from the manifest, never written here. The store rejects an
@@ -1518,6 +1550,11 @@ document.addEventListener('DOMContentLoaded', () => {
           action: () => showOverlay('keys', 'menu'),
         },
         {
+          icon: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18h6"/><path d="M10 21.5h4"/><path d="M12 2.5a6.5 6.5 0 0 0-3.7 11.8V15h7.4v-.7A6.5 6.5 0 0 0 12 2.5z"/></svg>`,
+          label: 'Tips', sub: 'Speed, limits, and quirks',
+          action: () => showOverlay('tips', 'menu'),
+        },
+        {
           icon: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 11.5v4.5"/><path d="M12 7.75h.01"/></svg>`,
           label: 'About', sub: 'Version and credits',
           action: () => showOverlay('about', 'menu'),
@@ -1547,6 +1584,10 @@ document.addEventListener('DOMContentLoaded', () => {
     } else if (mode === 'keys') {
       overlayTitle.textContent = 'API Keys';
       renderKeysScreen();
+
+    } else if (mode === 'tips') {
+      overlayTitle.textContent = 'Tips';
+      renderTipsScreen();
 
     } else if (mode === 'about') {
       overlayTitle.textContent = 'About';

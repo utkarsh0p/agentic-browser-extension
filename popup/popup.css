@@ -1245,3 +1245,16 @@ body {
 }
 
 .cold-note svg { flex-shrink: 0; margin-top: 1px; opacity: 0.55; }
+
+/* ── Tips screen ────────────────────────────────────────────────────────────── */
+/* Group headers reuse .about-label; only the list needs new rules. */
+.tips { padding: 6px 16px 18px; }
+
+.tip-group + .tip-group { margin-top: 17px; }
+
+.tip-line {
+  font-size: var(--fs-sm);
+  line-height: 1.55;
+  color: #555555;
+}
+.tip-line + .tip-line { margin-top: 8px; }

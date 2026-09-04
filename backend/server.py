@@ -206,6 +206,11 @@ class Lane:
     description:   str
     # Requires a live browser round trip, so it exists only on the socket transport.
     needs_browser: bool = False
+    # Carries no tools of its own without a Composio key. Offering this lane to the router
+    # without one guarantees a dead turn: the router can pick it, _build_tools then finds no
+    # key and builds nothing, and the model is left holding a lane named for acting in a
+    # connected service with nothing to act with. It apologises instead of escalating.
+    needs_app_key: bool = False
 
 
 LANES: dict[str, Lane] = {
@@ -232,6 +237,7 @@ LANES: dict[str, Lane] = {
         description=("an action in an outside service the user is NOT currently looking "
                      "at, reached through a connected account rather than through the "
                      "page in front of them"),
+        needs_app_key=True,
     ),
 }
 
@@ -993,7 +999,13 @@ async def _route(llm, body: "ChatRequest", allow_browser: bool,
     from typing import Literal
     from pydantic import Field, create_model
 
-    available = [n for n in LANES if allow_browser or not LANES[n].needs_browser]
+    # Both filters answer the same question: can this lane actually do anything on this
+    # turn? A lane whose tools cannot be built is worse than absent — the router picks it,
+    # the turn arrives with nothing, and only escalate saves it.
+    has_app_key = bool((body.tool_keys or {}).get("composio"))
+    available = [n for n in LANES
+                 if (allow_browser or not LANES[n].needs_browser)
+                 and (has_app_key  or not LANES[n].needs_app_key)]
     fallback  = FALLBACK_LANE if FALLBACK_LANE in available else LANE_ASK_PAGE
     if len(available) < 2:
         return fallback, None
@@ -1832,9 +1844,16 @@ if __name__ == "__main__":
     # silent: the extension keeps working, just against whatever tool list the running
     # process was started with. reload and workers are mutually exclusive in uvicorn.
     on_render = bool(os.environ.get("RENDER"))
+    # Never hardcode a worker count here. uvicorn spawns workers rather than forking, so
+    # each one imports langchain/langgraph/sklearn into its own address space with no
+    # copy-on-write sharing; four of them do not fit on a small instance. The symptom is
+    # not an error — the children are OOM-killed before "Started server process" ever
+    # prints, the port never opens, and the deploy fails port detection while the previous
+    # image keeps serving. WEB_CONCURRENCY is what the host sizes for the instance.
+    workers = int(os.environ.get("WEB_CONCURRENCY", 1))
     uvicorn.run(
         "server:app",
         host="0.0.0.0",
         port=int(os.environ.get("PORT", 5000)),
-        **({"workers": 4} if on_render else {"reload": True}),
+        **({"workers": workers} if on_render else {"reload": True}),
     )
