@@ -67,6 +67,20 @@
       </div>
     </div>
 
+    <!-- ── TEMPORARY: the backend runs on Render's free tier, which spins down when
+         idle, so the first request of a session can stall for ~30s with nothing to
+         explain it. Visibility is pure CSS — it rides the `chat-empty` class the
+         intro screen already uses, so there is no JS behind it.
+         To remove once the backend moves to a real server: delete this block and the
+         .cold-note rules in popup.css. Nothing else refers to it. ── -->
+    <div class="cold-note">
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="9"/>
+        <path d="M12 7.5V12l3 1.8"/>
+      </svg>
+      <span>Backend is hosted on Render — the first request may take up to 30s to wake it up.</span>
+    </div>
+
     <!-- ── Response area (fills the panel; pushes the input to the bottom).
          The .chat-history inside is created per tab by popup.js — see the
          per-tab View model there. ── -->

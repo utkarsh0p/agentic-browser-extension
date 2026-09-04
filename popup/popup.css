@@ -1225,3 +1225,23 @@ body {
 .about-link:hover    { border-color: #1a1a1a; }
 .about-link svg      { flex-shrink: 0; opacity: 0.45; }
 .about-link:hover svg { opacity: 0.8; }
+
+/* ── Cold-start notice (TEMPORARY) ──────────────────────────────────────────── */
+/* Shown only before the first message, riding the same `chat-empty` class as the
+   intro screen — no JS drives this. Delete this block and the markup in
+   popup.html once the backend is off Render's free tier. */
+.cold-note { display: none; }
+
+.popup-shell.chat-empty .cold-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 7px 14px 8px;
+  background: #fbf7ee;
+  border-bottom: 1px solid #f0e9da;
+  font-size: var(--fs-xs);
+  line-height: 1.45;
+  color: #8a7a5c;
+}
+
+.cold-note svg { flex-shrink: 0; margin-top: 1px; opacity: 0.55; }
