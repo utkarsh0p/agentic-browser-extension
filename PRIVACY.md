@@ -51,16 +51,12 @@ Your API keys (for Claude, Gemini, GPT, or Groq) are stored locally in your brow
 `chrome.storage.local`. They are sent to our backend server only to authenticate requests with
 that AI provider — they are never logged or stored on our server.
 
-An optional Composio key is stored the same way, and sent only when those tools are used.
-
 ## Third-party services
 
 Depending on your configuration, your message and the page content may be processed by:
 
 - **Anthropic** (Claude), **Google** (Gemini), **OpenAI** (GPT), or **Groq** — to generate
   answers and decide actions
-- **Composio** — for actions in connected apps (Gmail, Google Docs, and others), only if you
-  provide a Composio API key
 
 Each provider's own privacy policy applies to that interaction.
 

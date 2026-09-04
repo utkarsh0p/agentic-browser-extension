@@ -188,20 +188,6 @@ PROMPT_ESCALATE = (
     "action, and never guess at page content you were not given."
 )
 
-# Attached by lane rather than by tool: Composio names its tools at runtime, so they never
-# appear in CAPABILITIES and DEFAULT_CAP carries no fragment. Without this the app lane's
-# whole prompt was PROMPT_BASE plus a page hint — nothing said the tools were meta-tools,
-# so the model had to infer the search → connect → execute protocol from schemas alone.
-PROMPT_APPS = (
-    "Connected apps: your tools reach the user's own accounts — email, calendar, files, "
-    "chat and the like. They are meta-tools: the action you want is a parameter, not a "
-    "tool name. Search for the tool that fits the request, then execute it by its slug. "
-    "If the account is not connected yet, start the connection and give the user the link "
-    "that comes back — then stop and let them open it.\n\n"
-    "You have these tools right now, so never tell the user you cannot reach their apps. "
-    "If something genuinely will not work, say what you tried and what came back."
-)
-
 
 # ── Lane + capability registry ────────────────────────────────────────────────
 # One declaration per tool decides three things at once: which lanes may offer it, what
@@ -211,7 +197,6 @@ PROMPT_APPS = (
 LANE_CHAT     = "chat"
 LANE_ASK_PAGE = "ask_page"
 LANE_OPERATE  = "operate"
-LANE_APP      = "app"
 
 
 @dataclass(frozen=True)
@@ -220,11 +205,6 @@ class Lane:
     description:   str
     # Requires a live browser round trip, so it exists only on the socket transport.
     needs_browser: bool = False
-    # Carries no tools of its own without a Composio key. Offering this lane to the router
-    # without one guarantees a dead turn: the router can pick it, _build_tools then finds no
-    # key and builds nothing, and the model is left holding a lane named for acting in a
-    # connected service with nothing to act with. It apologises instead of escalating.
-    needs_app_key: bool = False
 
 
 LANES: dict[str, Lane] = {
@@ -244,28 +224,10 @@ LANES: dict[str, Lane] = {
                      "at, including acting inside a web app they already have open"),
         needs_browser=True,
     ),
-    LANE_APP: Lane(
-        # Described by the services it covers, not by "one the user is not looking at".
-        # The router is deliberately page-blind (see _router_input), so a page-relative
-        # test is the one thing it cannot evaluate: "can you send mail" fell to operate,
-        # which holds no mail tool and — being the single lane outside ESCALATING_LANES —
-        # cannot hand the turn on. It refused, in one step, with a Composio key set.
-        #
-        # The previous wording guarded the opposite case: "delete the first mail" while
-        # sitting in Gmail landing here. That still happens, and it is the error worth
-        # having — this lane carries `escalate`, so it costs one model call and recovers,
-        # while a wrong turn into operate is terminal. The bias toward app is deliberate.
-        description=("an action in a connected external service — email, calendar, files, "
-                     "chat, notes, issue tracker — carried out through the user's account. "
-                     "Choose this when the request names or implies such a service (send an "
-                     "email, add an event, message someone) and does not point at the page "
-                     "in front of them"),
-        needs_app_key=True,
-    ),
 }
 
 # Lanes that cannot act on the page, and therefore get `escalate`.
-ESCALATING_LANES = frozenset({LANE_CHAT, LANE_ASK_PAGE, LANE_APP})
+ESCALATING_LANES = frozenset({LANE_CHAT, LANE_ASK_PAGE})
 
 # On router failure, fall back to the lane that can do the most — behaving exactly as the
 # single-agent design did — rather than silently answering with fewer tools than the task
@@ -282,7 +244,7 @@ class Cap:
 
 CAPABILITIES: dict[str, Cap] = {
     "search_page":    Cap(frozenset({LANE_ASK_PAGE}),                prompt=PROMPT_RETRIEVAL),
-    "summarize_page": Cap(frozenset({LANE_ASK_PAGE, LANE_OPERATE, LANE_APP})),
+    "summarize_page": Cap(frozenset({LANE_ASK_PAGE, LANE_OPERATE})),
     "read_text":      Cap(frozenset({LANE_OPERATE}),                 prompt=PROMPT_READING),
     "read_page":      Cap(frozenset({LANE_ASK_PAGE, LANE_OPERATE})),
     "act":            Cap(frozenset({LANE_OPERATE}),                 prompt=PROMPT_ACTING),
@@ -291,9 +253,11 @@ CAPABILITIES: dict[str, Cap] = {
     "escalate":       Cap(frozenset(ESCALATING_LANES),               prompt=PROMPT_ESCALATE),
 }
 
-# Anything not declared above is an external integration (Composio ships its tools at
-# runtime, named per toolkit), so it lands in the app lane without needing an entry.
-DEFAULT_CAP = Cap(frozenset({LANE_APP}))
+# Fail-closed: a tool with no entry above reaches no lane at all, so it is never offered
+# and the omission shows up as a missing capability rather than as a tool appearing somewhere
+# nobody chose. Every tool _build_tools defines is declared, so this is unreachable today —
+# it is the guard for the next one.
+DEFAULT_CAP = Cap(frozenset())
 
 
 def _cap(name: str) -> Cap:
@@ -313,7 +277,7 @@ _SNAP_HEADER = {"page": re.compile(r'^page:\s*(.+)$', re.M),
                 "url":  re.compile(r'^url:\s*(.+)$',  re.M)}
 
 
-def _page_hint(snapshot: str, lane: str = LANE_OPERATE) -> str:
+def _page_hint(snapshot: str) -> str:
     """One line naming the page the user is on, from the map header the panel already sends.
 
     Costs ~20 tokens and removes a whole class of stall: without it the agent cannot tell
@@ -327,20 +291,12 @@ def _page_hint(snapshot: str, lane: str = LANE_OPERATE) -> str:
     if not (title or url):
         return ""
     where = " — ".join(x.group(1).strip() for x in (title, url) if x)
-    if lane == LANE_APP:
-        # This lane's tools reach the user's connected accounts, not the tab in front of
-        # them, so the sentence below is false here — and saying it produced exactly the
-        # refusal it sounds like: "I can only interact with the webpage that's currently
-        # open", in answer to a request its Composio tools could have served.
-        return (f"The user is looking at this page right now: {where}\n"
-                "That is background only. Your tools act on their connected accounts, not "
-                "on this page — use it only if the request refers to what they are viewing.")
     return (f"The user is looking at this page right now: {where}\n"
             "That is the page your tools act on. You do not need to ask which page they "
             "mean, and you do not need its address to work on it.")
 
 
-def _lane_prompt(tools: list, page_hint: str = "", lane: str = LANE_OPERATE) -> str:
+def _lane_prompt(tools: list, page_hint: str = "") -> str:
     """Compose the system prompt from the tools this lane actually received."""
     have  = {getattr(t, "name", "") for t in tools}
     order = [n for n in PROMPT_SEQUENCE if n in CAPABILITIES]
@@ -349,12 +305,6 @@ def _lane_prompt(tools: list, page_hint: str = "", lane: str = LANE_OPERATE) -> 
     parts, seen = [PROMPT_BASE], {PROMPT_BASE}
     if page_hint:
         parts.append(page_hint)
-    # Early, with the other "what to do" guidance: PROMPT_ESCALATE closes the prompt and
-    # says the page is off limits, which reads as a dead end unless what IS possible has
-    # already been stated. Keyed on the lane because Composio's tool names are not known
-    # until runtime — see PROMPT_APPS.
-    if lane == LANE_APP:
-        parts.append(PROMPT_APPS)
     for name in order:
         fragment = CAPABILITIES[name].prompt
         # Identity check, not equality: two tools may legitimately share one fragment and
@@ -370,7 +320,7 @@ def _on_tool_error(exc: Exception, request) -> str:
 
     Without this the exception propagates and the model never learns *why* the call
     failed, so it retries the same arguments verbatim — the cause of the repeated
-    identical Composio calls seen in the UI. The text also reaches the panel, because
+    identical tool calls seen in the UI. The text also reaches the panel, because
     the resulting ToolMessage is what feeds the `tool_result` SSE frame below.
     """
     name = (getattr(request, "tool_call", None) or {}).get("name", "")
@@ -384,9 +334,10 @@ def _on_tool_error(exc: Exception, request) -> str:
 class RepeatedToolCallGuard(AgentMiddleware):
     """Refuse an action already tried, byte-identical, since the last look at the page.
 
-    ToolCallLimitMiddleware caps calls per tool *name*, which cannot catch this without
-    knowing the offending name up front — and with Composio the real action is a
-    parameter, not the tool name. Matching on (name, args) instead is name-agnostic.
+    ToolCallLimitMiddleware caps calls per tool *name*, which is the wrong grain here: the
+    name is constant and the arguments are the action, so `act` legitimately runs many times
+    while re-running the same batch is the failure. Matching on (name, args) instead catches
+    it without anyone having to guess the offending name up front.
 
     Two things this deliberately does NOT do, both learned the hard way:
 
@@ -701,21 +652,7 @@ def _rate_limit_message(provider: str, e: Optional[Exception] = None) -> str:
             "provider lifts it.")
 
 
-class ComposioUnavailable(Exception):
-    """Composio would not hand over its tools.
-
-    A tag, not a message carrier: Composio's failures are indistinguishable from the
-    LLM's by text alone — both say "invalid api key" and both are 401 — but the handlers
-    below only know the *model* provider's name. Without this, a rejected Composio key
-    reports itself as "Invalid API key for claude" and sends the user to check a key that
-    was never the problem.
-    """
-
-
 def _sse_error_handler(e: Exception, provider: str) -> str:
-    # First, because `provider` names the model and this failure did not come from it.
-    if isinstance(e, ComposioUnavailable):
-        return str(e)
     if _is_auth_error(e):
         return f"Invalid API key for {provider}. Check your key in Settings."
     if _is_rate_limit_error(e):
@@ -858,8 +795,10 @@ class PageContext:
         return text[:1].upper() + text[1:] + "?"
 
 
-# Everything here is read-only or already gated by its own rules; anything else reaching the
-# agent is an external side effect (Composio) and asks in both modes by default.
+# Everything here is read-only or already gated by its own rules. The list is currently
+# exhaustive — every tool _build_tools can offer is named below — so the "not in this set"
+# branch in _hitl_config is the fail-closed default for whatever gets added next, not dead
+# weight: a new tool asks for approval until someone decides here that it need not.
 SAFE_TOOL_NAMES = frozenset({
     "read_text", "read_page", "act", "ask_user",
     # Retrieval reads the page and nothing else; escalate only re-dispatches this turn.
@@ -874,8 +813,9 @@ SAFE_TOOL_NAMES = frozenset({
 def _hitl_config(mode: str, tool_names: list, ctx: "PageContext") -> dict:
     """Which tools pause for a human, given the mode.
 
-    Unrestricted covers page actions only. External side effects still ask either way — a
-    wrong click is undone with Back, a sent email is not.
+    Unrestricted lifts the gate on page actions and nothing else: a wrong click is undone
+    with Back, so those are the ones safe to run unattended. Any tool not in
+    SAFE_TOOL_NAMES still asks in both modes.
     """
     have = set(tool_names)
     cfg: dict = {}
@@ -1030,12 +970,8 @@ def _route_instructions(lanes: list[str]) -> str:
     return (
         "Classify what the user wants so it can be handled by the right tools. "
         "Choose exactly one option.\n\n" + "\n".join(lines) + "\n\n"
-        # "the option that does things" was written when only one option acted. With a
-        # Composio key two of them do, and the phrase then points at whichever description
-        # carries the most action verbs — operate — regardless of where the work belongs.
         "Judge the request on its own. If it asks for something to be done rather than "
-        "answered, choose the option that does it — and when more than one option acts, "
-        "pick the one matching where the work happens, not merely that work is involved."
+        "answered, choose the option that does things."
     )
 
 
@@ -1062,13 +998,10 @@ async def _route(llm, body: "ChatRequest", allow_browser: bool,
     from typing import Literal
     from pydantic import Field, create_model
 
-    # Both filters answer the same question: can this lane actually do anything on this
-    # turn? A lane whose tools cannot be built is worse than absent — the router picks it,
-    # the turn arrives with nothing, and only escalate saves it.
-    has_app_key = bool((body.tool_keys or {}).get("composio"))
-    available = [n for n in LANES
-                 if (allow_browser or not LANES[n].needs_browser)
-                 and (has_app_key  or not LANES[n].needs_app_key)]
+    # The filter answers one question: can this lane actually do anything on this turn? A
+    # lane whose tools cannot be built is worse than absent — the router picks it, the turn
+    # arrives with nothing, and only escalate saves it.
+    available = [n for n in LANES if allow_browser or not LANES[n].needs_browser]
     fallback  = FALLBACK_LANE if FALLBACK_LANE in available else LANE_ASK_PAGE
     if len(available) < 2:
         return fallback, None
@@ -1297,30 +1230,11 @@ def _build_tools(body: "ChatRequest", client_call=None, lane: str = LANE_OPERATE
 
         tools.append(escalate)
 
-    composio_key = (body.tool_keys or {}).get("composio")
-    if composio_key:
-        from composio import Composio
-        from composio_langchain import LangchainProvider
-        try:
-            composio = Composio(api_key=composio_key, provider=LangchainProvider())
-            session = composio.create(user_id="default")
-            tools.extend(session.tools())
-        except Exception as e:
-            # Tagged and re-raised rather than swallowed. Continuing without the tools
-            # would hand the app lane an empty toolset — the dead turn `needs_app_key`
-            # exists to prevent — and the model would apologise instead of naming the
-            # one thing the user can actually fix.
-            raise ComposioUnavailable(
-                "Invalid Composio key. Check it in Settings."
-                if _is_auth_error(e)
-                else f"Composio is unreachable, so connected apps are unavailable: {e}"
-            ) from e
-
     # The registry, not a branch per lane, decides what this turn is allowed to hold.
     return [t for t in tools if lane in _cap(getattr(t, "name", "")).lanes]
 
 
-def _build_agent(llm, tools: list, lane: str = LANE_OPERATE,
+def _build_agent(llm, tools: list,
                  interrupt_on: Optional[dict] = None, checkpointer=None,
                  page_hint: str = ""):
     """create_agent (langchain>=1) over langgraph's create_react_agent: the same
@@ -1379,7 +1293,7 @@ def _build_agent(llm, tools: list, lane: str = LANE_OPERATE,
     return create_agent(
         model=llm,
         tools=tools,
-        system_prompt=_lane_prompt(tools, page_hint, lane),
+        system_prompt=_lane_prompt(tools, page_hint),
         middleware=middleware,
         checkpointer=checkpointer,
     )
@@ -1651,7 +1565,6 @@ class ChatRequest(BaseModel):
     # so a panel build that still sends it does not fail validation, and so restoring
     # conversational turns is a one-line change rather than a protocol change.
     history:    Optional[list[dict]] = None
-    tool_keys:  Optional[dict]       = None
 
 
 @app.post("/chat")
@@ -1681,13 +1594,7 @@ async def chat(
     # text the panel included.
     usage      = Usage()
     lane, _err = await _route(llm, body, allow_browser=False, usage=usage)
-    # Composio is the only tool source here that talks to the network while being built,
-    # so it is the only one that can fail this early. Unhandled it became a bare 500 with
-    # no detail, which is worse than the socket path's wrong-but-specific message.
-    try:
-        tools = _build_tools(body, None, lane, provider=provider, token=token)
-    except ComposioUnavailable as e:
-        raise HTTPException(status_code=502, detail=str(e))
+    tools      = _build_tools(body, None, lane, provider=provider, token=token)
     messages   = _build_messages(body.query)
 
     # No escalation on this transport. It would need a second pass mid-stream, and the
@@ -1697,8 +1604,8 @@ async def chat(
     if not tools:
         frames = _stream_chat(llm, messages, LLM_TIMEOUT, provider, usage=usage)
     else:
-        agent  = _build_agent(llm, tools, lane,
-                              page_hint=_page_hint(body.snapshot, lane))
+        agent  = _build_agent(llm, tools,
+                              page_hint=_page_hint(body.snapshot))
         frames = _stream_agent(agent, messages, LLM_TIMEOUT, provider, usage=usage)
 
     return StreamingResponse(_sse(_with_route(lane, frames)), media_type="text/event-stream")
@@ -1864,9 +1771,9 @@ async def chat_ws(ws: WebSocket):
                                       usage=usage, emit_usage=False)
             else:
                 agent = _build_agent(
-                    llm, tools, lane,
+                    llm, tools,
                     interrupt_on=_hitl_config(body.mode, [t.name for t in tools], page),
-                    page_hint=_page_hint(body.snapshot, lane),
+                    page_hint=_page_hint(body.snapshot),
                     # Interrupts need checkpointing. In-memory is right here and not a
                     # compromise: the run lives and dies with this connection, which pins
                     # it to one worker, so nothing has to be shared across processes.

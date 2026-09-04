@@ -31,8 +31,8 @@ There is no test suite, no linter, no package.json, and no bundler. Verification
 run the backend, load unpacked, drive a real page.
 
 `backend/.env` holds only `LANGSMITH_*` tracing vars. Provider keys (`claude`/`gemini`/
-`openai`/`groq`) and the Composio key arrive from the panel on each request — never add them
-to `.env` and never read them from `os.environ`.
+`openai`/`groq`) arrive from the panel on each request — never add them to `.env` and never
+read them from `os.environ`.
 
 Switch the panel's target with the single `BACKEND` constant at the top of `popup/popup.js`.
 
@@ -92,11 +92,13 @@ These will not fail loudly if broken:
    is just `await client_call(name, args)`.
 4. Observation-only tools must go in `OBSERVATION_TOOLS` — they are exempt from the repeat
    guard, because re-reading is how the agent recovers.
-5. Composio tools need no entry: anything undeclared falls to `DEFAULT_CAP` (the app lane).
+5. Step 2 is not optional. `DEFAULT_CAP` is fail-closed (`frozenset()`), so a tool with no
+   `CAPABILITIES` entry is built and then filtered out of every lane — it simply never
+   appears, rather than erroring.
 
 ### Lanes
 
-Every turn is routed once by a structured-output call that sees only the four lane
+Every turn is routed once by a structured-output call that sees only the three lane
 descriptions — never the tool schemas — before any tools are built. This is a safety
 property, not just a cost one: a `chat` turn *cannot* trigger a page action, because that
 lane holds no such tool. Every lane but `operate` gets `escalate`, and the hop is enforced by

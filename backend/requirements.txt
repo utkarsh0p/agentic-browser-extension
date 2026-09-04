@@ -28,6 +28,3 @@ langchain-anthropic
 # them directly.
 scikit-learn
 langchain-text-splitters>=1.0,<2
-
-# ── External tools ────────────────────────────────────────────────────────────
-composio-langchain

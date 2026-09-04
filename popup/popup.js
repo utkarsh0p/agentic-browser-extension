@@ -100,66 +100,18 @@ const TOOL_DISPLAY = {
   read_page:                          'Looking at the controls',
   act:                                'Acting on the page',
   goto:                               'Opening a page',
-  COMPOSIO_SEARCH_TOOLS:              'Finding tools',
-  COMPOSIO_CHECK_ACTIVE_CONNECTIONS:  'Checking connections',
-  COMPOSIO_INITIATE_CONNECTION:       'Connecting',
-  COMPOSIO_MANAGE_CONNECTIONS:        'Managing connections',
-  // EXECUTE_ACTION / MULTI_EXECUTE_TOOL are deliberately absent: they fall
-  // through to railLabel's slug branch so the row names the real action.
 };
 
 function prettify(name) {
   return (name || 'Working')
-    .replace(/^COMPOSIO_/, '')
     .replace(/_/g, ' ')
     .toLowerCase()
     .replace(/^./, c => c.toUpperCase());
 }
 
+// A rail row's text comes from the tool's NAME, never from free-form arg text.
 function toolLabel(name) {
   return TOOL_DISPLAY[name] || prettify(name);
-}
-
-// Composio's tools are meta-tools: the real action (GMAIL_SEND_EMAIL) is a
-// parameter, not the tool name. Read it from a fixed key list — never by
-// scanning args for "any string", which is what used to surface junk like
-// "wish" or "star" from whatever internal field happened to come first.
-const SLUG_KEYS = ['tool_slug', 'slug', 'action', 'tool_name', 'toolkit_slug', 'tool'];
-
-// Only slug-shaped values are accepted, so a wrong key can never render a nonce.
-const SLUG_SHAPE = /^[A-Z][A-Z0-9_]{3,}$/;
-
-function slugFromArgs(args) {
-  if (!args || typeof args !== 'object') return '';
-  const pick = (obj) => {
-    if (!obj || typeof obj !== 'object') return '';
-    for (const k of SLUG_KEYS) {
-      const v = obj[k];
-      if (typeof v === 'string' && SLUG_SHAPE.test(v.trim())) return v.trim();
-    }
-    return '';
-  };
-  const direct = pick(args);
-  if (direct) return direct;
-  // Multi-execute nests them: { tools: [{ tool_slug: 'GMAIL_SEND_EMAIL', … }] }
-  for (const v of Object.values(args)) {
-    if (Array.isArray(v)) {
-      for (const entry of v) {
-        const nested = pick(entry);
-        if (nested) return nested;
-      }
-    }
-  }
-  return '';
-}
-
-// A rail row's text comes from the tool's NAME, never from free-form arg text.
-function railLabel(name, args) {
-  if (TOOL_DISPLAY[name]) return TOOL_DISPLAY[name];
-  if (/^COMPOSIO_/.test(name || '')) {
-    return `${prettify(slugFromArgs(args) || name)} · executing`;
-  }
-  return prettify(name);
 }
 
 const PROVIDER_ORDER = ['claude', 'gemini', 'openai', 'groq'];
@@ -170,25 +122,17 @@ const ROUTE_LABELS = {
   chat:     'Answering from knowledge',
   ask_page: 'Reading this page',
   operate:  'Working on the page',
-  app:      'Using a connected app',
 };
 
 // ── Key metadata ──────────────────────────────────────────────────────────────
-// Provider keys live in storage under `apiKeys`, tool keys under `toolKeys`.
-// Carried over from the options page this panel replaced.
-
-const TOOL_ORDER = ['composio'];
-
-const TOOLS = {
-  composio: { label: 'Composio', sub: 'App Integrations', glyph: 'C' },
-};
+// Provider keys live in storage under `apiKeys`. Carried over from the options
+// page this panel replaced.
 
 const KEY_HINTS = {
   claude:   { placeholder: 'sk-ant-api03-…', host: 'console.anthropic.com',  url: 'https://console.anthropic.com/',       prefix: 'sk-ant-' },
   gemini:   { placeholder: 'AIzaSy…',        host: 'aistudio.google.com',    url: 'https://aistudio.google.com/apikey',   prefix: 'AIza'    },
   openai:   { placeholder: 'sk-proj-…',      host: 'platform.openai.com',    url: 'https://platform.openai.com/api-keys', prefix: 'sk-'     },
   groq:     { placeholder: 'gsk_…',          host: 'console.groq.com',       url: 'https://console.groq.com/keys',        prefix: 'gsk_'    },
-  composio: { placeholder: 'ak_…',           host: 'app.composio.dev',       url: 'https://app.composio.dev/',            prefix: 'ak_'     },
 };
 
 const EYE_OPEN_ICON = `<svg class="eye-open" width="14" height="14" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg>`;
@@ -414,7 +358,6 @@ document.addEventListener('DOMContentLoaded', () => {
   let selectedProvider  = null;
   let selectedModel     = null;
   let savedApiKeys      = {};
-  let savedToolKeys     = {};
 
   // ── One conversation per panel ──────────────────────────────────────────────
   // This is a side panel, not a popup: one document per window, alive across
@@ -547,17 +490,7 @@ document.addEventListener('DOMContentLoaded', () => {
         eg:   host ? `“What does ${host} say about …”` : '“What does this page say about …”',
         run:  () => prefill(host ? `What does ${host} say about ` : 'What does this page say about '),
       },
-      // Both of these open the key screen rather than filling the box: each one needs a
-      // key before it can do anything, and Composio's tools are not even built
-      // server-side without one.
-      {
-        icon: 'send',
-        name: 'Reach your connected apps',
-        eg:   savedToolKeys.composio
-          ? '“Email me a summary of this page”'
-          : 'Connect apps with a Composio key',
-        run:  () => showOverlay('keys'),
-      },
+      // Opens the key screen rather than filling the box: nothing here runs without a key.
       {
         icon: 'key',
         name: 'Bring your own model',
@@ -680,10 +613,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
   async function loadSettings() {
     const res = await chrome.storage.local.get(
-      ['apiKeys', 'toolKeys', 'apiProvider', 'apiKey', 'selectedProvider', 'selectedModelId']
+      ['apiKeys', 'apiProvider', 'apiKey', 'selectedProvider', 'selectedModelId']
     );
-    savedApiKeys  = res.apiKeys  || {};
-    savedToolKeys = res.toolKeys || {};
+    savedApiKeys = res.apiKeys || {};
 
     // Migrate legacy single-key storage
     if (res.apiProvider && res.apiKey && !savedApiKeys[res.apiProvider])
@@ -1188,10 +1120,7 @@ document.addEventListener('DOMContentLoaded', () => {
         // Accept both the new object form {name,args,id} and the legacy string form
         const isObj = tool && typeof tool === 'object';
         const name  = isObj ? tool.name : tool;
-        const args  = isObj ? tool.args : null;
-        const label = railLabel(name, args);
-        // Temporary: reveals Composio's real arg keys so SLUG_KEYS can be tightened
-        console.debug('[SiteWhisper] tool', name, Object.keys(args || {}));
+        const label = toolLabel(name);
 
         const last = steps[steps.length - 1];
         if (last && last.kind === 'tool' && last.label === label && lastToolEl) {
@@ -1332,15 +1261,13 @@ document.addEventListener('DOMContentLoaded', () => {
   // inputs — a "Saved" badge stands in, so a stored secret can't be read off
   // the screen. Saving merges, so a key the user didn't retype survives.
 
+  // A list of one. Kept as a list because a second kind of key — a connector or an
+  // integration — is a group added here rather than a rewrite of the screen.
   const KEY_GROUPS = [
-    { title: 'Provider Keys', ids: PROVIDER_ORDER, scope: 'api',
+    { title: 'Provider Keys', ids: PROVIDER_ORDER,
       meta: id => PROVIDERS[id],
       iconHTML: id => PROVIDERS[id].icon,
       saved: id => !!savedApiKeys[id] },
-    { title: 'Tool Keys', ids: TOOL_ORDER, scope: 'tool',
-      meta: id => TOOLS[id],
-      iconHTML: id => `<span class="key-glyph">${TOOLS[id].glyph}</span>`,
-      saved: id => !!savedToolKeys[id] },
   ];
 
   // One accordion row: the name is all you see until it's tapped open.
@@ -1418,24 +1345,23 @@ document.addEventListener('DOMContentLoaded', () => {
     };
 
     saveBtn.addEventListener('click', async () => {
-      const collected = { api: {}, tool: {} };
+      const collected = {};
       for (const group of KEY_GROUPS) {
         for (const id of group.ids) {
           const val = overlayList.querySelector(`.key-input[data-key="${id}"]`)?.value.trim();
-          if (val) collected[group.scope][id] = val;
+          if (val) collected[id] = val;
         }
       }
-      const added = [...Object.keys(collected.api), ...Object.keys(collected.tool)];
+      const added = Object.keys(collected);
       if (!added.length) { setStatus('Enter at least one key to save.', true); return; }
 
       saveBtn.disabled    = true;
       saveBtn.textContent = 'Saving…';
       try {
         // Merge over what's stored — never clobber a key that wasn't retyped
-        const cur = await chrome.storage.local.get(['apiKeys', 'toolKeys']);
+        const cur = await chrome.storage.local.get(['apiKeys']);
         await chrome.storage.local.set({
-          apiKeys:  { ...(cur.apiKeys  || {}), ...collected.api  },
-          toolKeys: { ...(cur.toolKeys || {}), ...collected.tool },
+          apiKeys: { ...(cur.apiKeys || {}), ...collected },
         });
       } catch (err) {
         saveBtn.disabled    = false;
@@ -1447,7 +1373,6 @@ document.addEventListener('DOMContentLoaded', () => {
       // Re-reads keys, auto-selects a provider and re-renders the selectors
       await loadSettings();
       updateSetupGate();
-      refreshIntro();   // a Composio key just arriving changes what the apps row offers
 
       added.forEach(id => {
         overlayList.querySelector(`.saved-badge[data-badge="${id}"]`)?.classList.add('visible');
@@ -1999,16 +1924,15 @@ document.addEventListener('DOMContentLoaded', () => {
         }
       };
 
+      // No conversation goes up. Each message is a self-contained job that finishes
+      // inside its own turn, so previous turns are cost without purpose — see
+      // _build_messages in the backend. The panel still shows and stores everything;
+      // this only governs what the model is given.
       const payload = {
         query,
         snapshot:  snapshot || '',
         mode:      agentMode,
         model:     selectedModel?.id,
-        // No conversation goes up. Each message is a self-contained job that finishes
-        // inside its own turn, so previous turns are cost without purpose — see
-        // _build_messages in the backend. The panel still shows and stores everything;
-        // this only governs what the model is given.
-        tool_keys: savedToolKeys,
       };
 
       let errored = false;

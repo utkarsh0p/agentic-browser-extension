@@ -539,20 +539,6 @@ body {
 .saved-badge.visible { display: flex; }
 .saved-badge svg { width: 9px; height: 9px; }
 
-/* Tool keys have no brand SVG — a letter badge stands in */
-.key-glyph {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 16px;
-  height: 16px;
-  border-radius: 5px;
-  background: #f0f0ec;
-  color: #6a6a62;
-  font-size: var(--fs-2xs);
-  font-weight: 700;
-}
-
 .input-wrap { position: relative; }
 
 .key-input {

@@ -21,7 +21,6 @@ server — you add a key from Anthropic, Google, OpenAI or Groq, and it lives in
 | **Fill things in** | *"Fill this form with my details and submit it"* — it asks you for anything it doesn't know |
 | **Look something up** | *"Search for the tallest building and tell me who built it"* — the browser is its internet access; it navigates and reads |
 | **Work inside an app you have open** | *"Delete the first email"* while you're sitting in Gmail |
-| **Reach apps you don't have open** | Add a [Composio](https://composio.dev) key and it can search, connect to, and act in 500+ services |
 
 ---
 
@@ -99,7 +98,7 @@ the dialog's contents, when the page was still rendering it says so, and when it
 ### Lanes
 
 Every turn is routed once, before any tools are loaded, by a single structured-output call
-that sees the four lane descriptions and the request — never the tool schemas. That costs
+that sees the three lane descriptions and the request — never the tool schemas. That costs
 ~190 tokens and happens once per turn, not once per model call.
 
 | Lane | For | Tools |
@@ -107,7 +106,6 @@ that sees the four lane descriptions and the request — never the tool schemas.
 | `chat` | conversation, general knowledge | *(none)* |
 | `ask_page` | a question about this page | `search_page` `summarize_page` `read_page` |
 | `operate` | something to be **done** in the browser | `read_page` `read_text` `act` `goto` `ask_user` `summarize_page` |
-| `app` | an action in a service you're not looking at | Composio tools · `summarize_page` |
 
 This is a safety property as much as a cost one: a conversational message *cannot* trip an
 approval prompt or a page action, because the lane handling it has no such tool to call.
@@ -180,11 +178,10 @@ A pill in the header toggles how much the agent asks before acting.
 | Fill, check, select, scroll, ordinary clicks | runs | runs |
 | Submits, and clicks named delete / buy / pay / send… | **asks** | runs |
 | Typing into a password or card field | **asks** | runs |
-| External side effects (send an email, delete a file…) | **asks** | **asks** |
 | `ask_user` — it needs a value from you | asks | asks |
 
-Unrestricted deliberately covers page actions only: a wrong click is undone with Back, a
-sent email is not. It's **session-scoped** — reopening the panel always returns to
+Unrestricted lifts the gate on ordinary page actions and nothing more — the ones a wrong
+click undoes with Back. It's **session-scoped** — reopening the panel always returns to
 Restricted, so it can never be left on by accident.
 
 Approval prompts name the element rather than the tool — *Click "Delete account"?* — and
@@ -203,10 +200,10 @@ and the value is never written to the saved conversation.
 
 ## What you see while it works
 
-Each turn shows a live reasoning rail — *Reading the page*, *Acting on the page*, the app
-action it's executing — with the lane it chose as its own row, so a misroute is visible
-rather than mysterious. Repeated calls collapse into one row with a `×N` badge. Approvals
-and questions appear inline in the rail, in place.
+Each turn shows a live reasoning rail — *Reading the page*, *Acting on the page*, *Opening
+a page* — with the lane it chose as its own row, so a misroute is visible rather than
+mysterious. Repeated calls collapse into one row with a `×N` badge. Approvals and questions
+appear inline in the rail, in place.
 
 When the turn finishes the rail folds into a chip:
 
