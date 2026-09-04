@@ -60,10 +60,15 @@ User types question
 **AI Providers**
 | Provider | LLM |
 |---|---|
-| Claude (Anthropic) | Haiku 4.5 / Sonnet 4.6 / Opus 4.6 |
-| Gemini (Google) | 2.5 Flash / 2.5 Pro / 2.0 Flash |
-| GPT (OpenAI) | GPT-4.1 mini / GPT-4.1 / o4-mini |
-| Groq (GroqCloud) | GPT-OSS 120B / GPT-OSS 20B / Qwen3.6 27B |
+| Claude (Anthropic) | Opus 5 / Sonnet 5 |
+| Gemini (Google) | 3.7 Flash / 3.6 Flash |
+| GPT (OpenAI) | GPT-5.6 Sol / GPT-5.6 Terra |
+| Groq (GroqCloud) | Qwen3.6 27B |
+
+The list is short on purpose. Page automation needs a model that can hold a ~200-line
+element map and keep its place after the context middleware trims it; the cheaper tiers
+loop instead of failing, which costs the user real credit. The first entry per provider is
+the default.
 
 ---
 

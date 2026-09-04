@@ -194,26 +194,47 @@ const KEY_HINTS = {
 const EYE_OPEN_ICON = `<svg class="eye-open" width="14" height="14" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg>`;
 const EYE_SHUT_ICON = `<svg class="eye-closed" style="display:none" width="14" height="14" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21"/></svg>`;
 
+// Only models that can actually drive the page agent. The bar is not general
+// intelligence, it is four specific things this harness demands: nested-JSON tool calls
+// for act(actions), structured output for the router, picking the right line out of a
+// ~200-line element map, and staying oriented after TrimSupersededMaps has deleted every
+// map but the newest. Cheap and "lite" tiers fail the last two first, and a model that
+// thrashes is worse than one that is absent — nothing caps repeats below TOOL_CALL_LIMIT,
+// so a weak model burns minutes of the user's own API credit before anything intervenes.
+//
+// models[0] is the default: a stored selectedModelId that no longer exists falls back to
+// it (see the restore in loadSettings), so the order here is load-bearing. Keep each
+// provider's first entry in step with _resolve_llm's default in server.py.
 const MODELS = {
   openai: [
-    { id: 'gpt-4.1-mini', label: 'GPT-4.1 mini' },
-    { id: 'gpt-4.1',      label: 'GPT-4.1'      },
-    { id: 'o4-mini',      label: 'o4-mini'       },
+    { id: 'gpt-5.6-sol',   label: 'GPT-5.6 Sol'   },
+    { id: 'gpt-5.6-terra', label: 'GPT-5.6 Terra' },
   ],
   gemini: [
-    { id: 'gemini-2.5-flash', label: 'Gemini 2.5 Flash' },
-    { id: 'gemini-2.5-pro',   label: 'Gemini 2.5 Pro'   },
-    { id: 'gemini-2.0-flash', label: 'Gemini 2.0 Flash' },
+    { id: 'gemini-3.7-flash', label: 'Gemini 3.7 Flash' },
+    { id: 'gemini-3.6-flash', label: 'Gemini 3.6 Flash' },
   ],
+  // Thin by evidence, not by oversight. GPT-OSS 120B was measured spiralling through 14
+  // tool calls on a task Qwen completed, and 20B is the same model with less to work with.
+  // groq/compound is excluded on architecture rather than quality: it brings its own
+  // built-in web search and code execution, which fights a tool surface whose whole point
+  // is acting on the page the user is already looking at.
+  //
+  // Caveat: qwen3.6-27b is preview status on GroqCloud, and Groq does retire preview
+  // models (Llama 3.1 8B and 3.3 70B went on 2026-06-17). If it disappears, this provider
+  // has no replacement that has been shown to work here.
   groq: [
-    { id: 'openai/gpt-oss-120b', label: 'GPT-OSS 120B' },
-    { id: 'openai/gpt-oss-20b',  label: 'GPT-OSS 20B'  },
-    { id: 'qwen/qwen3.6-27b',    label: 'Qwen3.6 27B'  },
+    { id: 'qwen/qwen3.6-27b', label: 'Qwen3.6 27B' },
   ],
+  // Opus 5 and Sonnet 5 are the only Claude models that reason without a code change:
+  // get_claude_client passes no `thinking` parameter, and omitting it means adaptive
+  // thinking on the 5 family but nothing at all on Haiku 4.5 / Sonnet 4.6 / Opus 4.6 —
+  // which is the same reasoning-off state that made GPT-OSS 120B thrash. Fable 5 is
+  // deliberately absent: always-on thinking and turns that can run minutes are wrong for
+  // a side panel, whatever they do for quality.
   claude: [
-    { id: 'claude-haiku-4-5',  label: 'Claude Haiku 4.5'  },
-    { id: 'claude-sonnet-4-6', label: 'Claude Sonnet 4.6' },
-    { id: 'claude-opus-4-6',   label: 'Claude Opus 4.6'   },
+    { id: 'claude-opus-5',   label: 'Claude Opus 5'   },
+    { id: 'claude-sonnet-5', label: 'Claude Sonnet 5' },
   ],
 };
 
@@ -359,6 +380,10 @@ document.addEventListener('DOMContentLoaded', () => {
   const shell        = document.querySelector('.popup-shell');
   const setupBtn     = document.getElementById('setupBtn');
   const newChatBtn   = document.getElementById('newChatBtn');
+  // The #intro wrapper itself is never touched from here — it is shown and hidden by
+  // the .chat-empty class on the shell, so only its contents need a handle.
+  const introList    = document.getElementById('introList');
+  const introFoot    = document.getElementById('introFoot');
 
   // Active-page indicator in the header
   const pageIndicator = document.getElementById('pageIndicator');
@@ -449,7 +474,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   function scrollToEnd(el) { el.scrollTop = el.scrollHeight; }
 
-  function reveal() { responseArea.classList.add('visible'); }
+  function reveal() { responseArea.classList.add('visible'); refreshIntro(); }
 
   // Put the one chat element on screen and sync the controls to it.
   function attach(view) {
@@ -460,6 +485,7 @@ document.addEventListener('DOMContentLoaded', () => {
     scrollToEnd(view.el);
     refreshSendButton();
     refreshNewChatBtn();
+    refreshIntro();
   }
 
   // Empty the conversation. The only thing that clears a chat now is the user asking.
@@ -471,6 +497,104 @@ document.addEventListener('DOMContentLoaded', () => {
     saveChat(view);
     responseArea.classList.remove('visible');
     refreshNewChatBtn();
+    refreshIntro();
+  }
+
+  // ── Intro ───────────────────────────────────────────────────────────────────
+  // What the extension does, shown while the chat is empty. It leads with browser
+  // automation on purpose: the placeholder and the panel's shape both suggest a
+  // summariser, so acting on the page is the one capability nobody discovers on
+  // their own. Each row names a capability and shows one thing to type — a list of
+  // bare prompts would teach only those prompts.
+
+  const INTRO_IC = {
+    zap:    '<polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>',
+    search: '<circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>',
+    send:   '<line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>',
+    key:    '<path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/>',
+  };
+
+  function introIcon(name) {
+    return `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${INTRO_IC[name]}</svg>`;
+  }
+
+  // Put an example in the box rather than sending it. The agent can click things, so
+  // the first one a person ever runs should be one they have actually read.
+  function prefill(text) {
+    input.value = text;
+    input.dispatchEvent(new Event('input'));   // resize the textarea, enable Send
+    input.focus();
+    input.setSelectionRange(text.length, text.length);
+  }
+
+  function introRows() {
+    const host = pageHost.textContent;
+    return [
+      {
+        icon: 'zap',
+        name: 'Automate the browser',
+        // Fixed, unlike the row below: a whole errand across sites is the clearest
+        // proof that it is not stuck on the tab you happen to have open.
+        eg:   '“Open a MrBeast video on YouTube”',
+        run:  () => prefill('Open a MrBeast video on YouTube'),
+      },
+      {
+        icon: 'search',
+        name: 'Ask what’s on it',
+        eg:   host ? `“What does ${host} say about …”` : '“What does this page say about …”',
+        run:  () => prefill(host ? `What does ${host} say about ` : 'What does this page say about '),
+      },
+      // Both of these open the key screen rather than filling the box: each one needs a
+      // key before it can do anything, and Composio's tools are not even built
+      // server-side without one.
+      {
+        icon: 'send',
+        name: 'Reach your connected apps',
+        eg:   savedToolKeys.composio
+          ? '“Email me a summary of this page”'
+          : 'Connect apps with a Composio key',
+        run:  () => showOverlay('keys'),
+      },
+      {
+        icon: 'key',
+        name: 'Bring your own model',
+        eg:   'Claude · Gemini · GPT · Groq — keys stay on this device',
+        run:  () => showOverlay('keys'),
+      },
+    ];
+  }
+
+  function renderIntro() {
+    introList.replaceChildren();
+    for (const row of introRows()) {
+      const btn = document.createElement('button');
+      btn.type      = 'button';
+      btn.className = 'intro-row';
+      btn.innerHTML = `
+        <span class="intro-ic">${introIcon(row.icon)}</span>
+        <span class="intro-meta">
+          <span class="intro-name">${escHtml(row.name)}</span>
+          <span class="intro-eg">${escHtml(row.eg)}</span>
+        </span>`;
+      btn.addEventListener('click', row.run);
+      introList.appendChild(btn);
+    }
+    paintIntroFoot();
+  }
+
+  // The one place the mode pill is ever explained, so it tracks the real setting
+  // instead of assuming the default.
+  function paintIntroFoot() {
+    introFoot.textContent = agentMode === 'unrestricted'
+      ? 'Unrestricted · acts without asking'
+      : 'Restricted · asks before it clicks';
+  }
+
+  function refreshIntro() {
+    const empty = !activeView()?.el.childElementCount;
+    shell.classList.toggle('chat-empty', empty);
+    if (empty) renderIntro();
   }
 
   // ── Chat persistence ────────────────────────────────────────────────────
@@ -610,12 +734,18 @@ document.addEventListener('DOMContentLoaded', () => {
     try { host = new URL(tab?.url || '').hostname.replace(/^www\./, ''); }
     catch { /* chrome://, about:, a local file — nothing worth showing */ }
 
-    if (!host) { pageIndicator.classList.remove('visible'); return; }
+    if (!host) {
+      pageIndicator.classList.remove('visible');
+      pageHost.textContent = '';   // the intro reads this to name the current site
+      refreshIntro();
+      return;
+    }
     pageHost.textContent = host;
     pageHost.title       = tab.url;
     if (tab.favIconUrl) pageFavicon.src = tab.favIconUrl;
     else pageFavicon.removeAttribute('src');
     pageIndicator.classList.add('visible');
+    refreshIntro();
   }
 
   // ── Tab tracking ───────────────────────────────────────────────────────────
@@ -1315,6 +1445,7 @@ document.addEventListener('DOMContentLoaded', () => {
       // Re-reads keys, auto-selects a provider and re-renders the selectors
       await loadSettings();
       updateSetupGate();
+      refreshIntro();   // a Composio key just arriving changes what the apps row offers
 
       added.forEach(id => {
         overlayList.querySelector(`.saved-badge[data-badge="${id}"]`)?.classList.add('visible');
@@ -1463,6 +1594,7 @@ document.addEventListener('DOMContentLoaded', () => {
       ? 'Page actions run without asking. External tools still ask. Click to restrict.'
       : 'Consequential page actions ask first. Click to allow them without asking.';
     modeBtn.setAttribute('aria-pressed', String(open));
+    paintIntroFoot();   // the intro explains this pill; it must not describe the old state
   }
 
   modeBtn.addEventListener('click', () => {
@@ -1498,14 +1630,17 @@ document.addEventListener('DOMContentLoaded', () => {
   // Returns content.js's snapshot response ({ snapshot, generation, ... }) or null if the
   // page can't provide one. Best-effort by design: a missing snapshot must degrade to
   // text-only chat, never fail the request.
-  function getPageSnapshot(tab, cb) {
+  // `opts.waitForStable` asks content.js to let the page finish drawing before it measures.
+  // Only worth it where the page is known to be new — see snapshotAfterLoad. read_page and
+  // the turn-start snapshot pass nothing and stay immediate.
+  function getPageSnapshot(tab, cb, opts = {}) {
     if (!tab || tab.id == null) { cb(null); return; }
 
     const request = (mayInject) => {
       // Wrapped because a snapshot is a nice-to-have: sendMessage can throw synchronously
       // on a tab that died mid-request, and that must not take the whole turn down with it.
       try {
-        chrome.tabs.sendMessage(tab.id, { type: 'SW_SNAPSHOT' }, (res) => {
+        chrome.tabs.sendMessage(tab.id, { type: 'SW_SNAPSHOT', ...opts }, (res) => {
           if (chrome.runtime.lastError) {
             // No receiver. content.js is declared for <all_urls>, but declared scripts
             // only reach pages loaded *after* the extension did, so older tabs need an
@@ -1661,7 +1796,12 @@ document.addEventListener('DOMContentLoaded', () => {
       if (fresh) tab = fresh;
     } catch { /* the tab went away; the snapshot attempt below will fail cleanly */ }
 
-    const res = await new Promise((resolve) => getPageSnapshot(tab, resolve));
+    // waitForTabLoad above only proves the document and its subresources arrived. On a
+    // JS-rendered site that is well before the controls exist, so the map taken here would
+    // describe an empty shell — the same partial-map problem the in-page click path has,
+    // one layer down. waitForStable asks the page whether it has stopped growing.
+    const res = await new Promise((resolve) =>
+      getPageSnapshot(tab, resolve, { waitForStable: true }));
     const snapshot = recordSnapshot(view, res);
     const where = tab.url ? headline.replace('%url%', tab.url) : headline.replace(' %url%', '');
 

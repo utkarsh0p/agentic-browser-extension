@@ -76,6 +76,12 @@ RISKY_VERBS   = frozenset({"submit", "press"})
 MODEL_CALL_LIMIT       = 25
 TOOL_CALL_LIMIT        = 30
 IDENTICAL_CALL_LIMIT   = 2
+# The same cap, but counted across the whole turn instead of per look at the page. Needed
+# because IDENTICAL_CALL_LIMIT resets on every observation, so alternating act/read_page
+# retries one dead action indefinitely — the shape every observed spiral has taken. Set
+# well above IDENTICAL_CALL_LIMIT: re-reading legitimately re-opens an action, and this is
+# only here to stop that being an infinite supply of retries.
+IDENTICAL_CALL_CEILING = 4
 
 # Transcript size at which page *text* starts being cleared. Sized to one turn's working
 # set rather than to a context window: the point is to keep each model call small, because
@@ -354,48 +360,98 @@ class RepeatedToolCallGuard(AgentMiddleware):
     id on page B colliding with the same id on page A, since ids are small integers and the
     JSON is byte-identical across pages.
 
+    A second, unscoped counter sits behind that one, and it is the reason this class is not
+    just the epoch rule. Because every observation clears the epoch counters, and because
+    the prompt's recovery ladder tells the agent to re-read whenever something is missing,
+    act/read_page/act is both the natural response to a bad map AND a way to retry one dead
+    action forever — nothing stopped it short of TOOL_CALL_LIMIT ending the whole turn.
+    Every spiral observed in practice had exactly that shape. So (name, args) is also
+    counted across the turn, with a higher ceiling: a fresh look still re-opens an action a
+    few times, which is the behaviour worth keeping, but it is no longer an unlimited supply.
+
     State is per-instance, which is per-request here: the agent (and so this middleware)
     is constructed inside the request handler, not cached like the LLM clients are.
     """
 
-    def __init__(self, limit: int = IDENTICAL_CALL_LIMIT) -> None:
+    def __init__(self, limit: int = IDENTICAL_CALL_LIMIT,
+                 ceiling: int = IDENTICAL_CALL_CEILING) -> None:
         super().__init__()
-        self.limit  = limit
-        self.tools  = []          # registers no tools of its own
+        self.limit   = limit
+        self.ceiling = ceiling
+        self.tools   = []         # registers no tools of its own
         self._seen: dict[str, int] = {}
+        self._total: dict[str, int] = {}
         self._epoch = 0
 
-    def _exhausted(self, request) -> bool:
+    def _exhausted(self, request) -> Optional[str]:
+        """None to let the call through, else which cap it hit ("epoch" or "turn")."""
         call = getattr(request, "tool_call", None) or {}
         name = call.get("name") or ""
         if name in OBSERVATION_TOOLS:
             self._epoch += 1
-            return False
+            return None
         try:
             args = json.dumps(call.get("args", {}), sort_keys=True, default=str)
         except (TypeError, ValueError):
             args = str(call.get("args"))
-        key = f"{self._epoch}::{name}::{args}"
-        self._seen[key] = self._seen.get(key, 0) + 1
-        return self._seen[key] > self.limit
 
-    def _refusal(self, request) -> ToolMessage:
+        # Counted twice, deliberately. The epoch-scoped key is the useful one — it says
+        # "you tried this and you have not looked since" and a fresh look clears it. The
+        # unscoped key exists because that clearing is unlimited: read_page bumps the epoch,
+        # so act/read_page/act retries a dead action until TOOL_CALL_LIMIT ends the turn,
+        # which is minutes of the user's own API spend on a click that will never work.
+        both = f"{name}::{args}"
+        self._total[both] = self._total.get(both, 0) + 1
+
+        key = f"{self._epoch}::{both}"
+        self._seen[key] = self._seen.get(key, 0) + 1
+
+        if self._seen[key] > self.limit:
+            return "epoch"
+        if self._total[both] > self.ceiling:
+            return "turn"
+        return None
+
+    def _refusal(self, request, scope: str) -> ToolMessage:
         call = getattr(request, "tool_call", None) or {}
         # Not status="error": a block is not a tool failure, and marking it as one made the
         # model apply the prompt's two-strikes "stop and tell the user" rule and give up.
         # The content is a ladder of alternatives, because the old wording offered only
         # "change the arguments or tell the user it failed" — and a zero-arg tool has no
         # arguments to change, leaving surrender as the sole option on the menu.
-        return ToolMessage(
-            content=(
-                f"Not run: '{call.get('name')}' was already tried {self.limit}x with these "
-                "exact arguments and the page has not been read since, so the result would "
-                "be the same. This is not a failure — try something else:\n"
+        if scope == "turn":
+            # Re-reading is normally the way out, so this branch must not offer it: the
+            # whole point of the turn-scoped cap is that re-reading has already been tried
+            # and did not help. Pointing back at read_page here would be the loop.
+            reason = (
+                f"was already tried {self.ceiling}x with these exact arguments in this "
+                "turn, across several reads of the page. Re-reading has not changed the "
+                "outcome, so it will not this time either — this exact call is done."
+            )
+            ladder = (
+                "- a DIFFERENT element, or a different approach to the same goal\n"
+                '- act with {"verb":"wait"} if the page may still have been rendering\n'
+                "- press/submit with no id, to hit whatever has focus\n"
+                "- ask_user what they can see on screen — they are looking at it\n"
+                "- if none of that applies, say what you were unable to do and stop"
+            )
+        else:
+            reason = (
+                f"was already tried {self.limit}x with these exact arguments and the page "
+                "has not been read since, so the result would be the same."
+            )
+            ladder = (
                 "- read_page to see the page as it is NOW; the earlier map may have been "
                 "incomplete or truncated, and re-reading also re-enables this action\n"
                 '- act with {"verb":"wait"} if the page may still have been rendering\n'
                 "- a different element, or press/submit with no id to hit whatever has focus\n"
                 "- ask_user what they can see on screen"
+            )
+
+        return ToolMessage(
+            content=(
+                f"Not run: '{call.get('name')}' {reason} This is not a failure — try "
+                f"something else:\n{ladder}"
             ),
             tool_call_id=call.get("id") or "",
             name=call.get("name") or "",
@@ -404,11 +460,13 @@ class RepeatedToolCallGuard(AgentMiddleware):
     # Both paths implemented: /chat streams via astream(), but a sync entry point
     # would otherwise raise NotImplementedError.
     def wrap_tool_call(self, request, handler):
-        return self._refusal(request) if self._exhausted(request) else handler(request)
+        scope = self._exhausted(request)
+        return self._refusal(request, scope) if scope else handler(request)
 
     async def awrap_tool_call(self, request, handler):
-        if self._exhausted(request):
-            return self._refusal(request)
+        scope = self._exhausted(request)
+        if scope:
+            return self._refusal(request, scope)
         return await handler(request)
 
 
@@ -520,15 +578,20 @@ def get_claude_client(token: str, model_id: str):
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
+# Each fallback is the first entry of that provider's list in popup.js, and has to stay
+# that way: the panel drops back to models[0] when a stored selection no longer exists, so
+# a mismatch here means the turn silently runs on a different model than the one showing in
+# the picker. These are the defaults rather than the cheapest option on purpose — a model
+# that cannot read the element map does not fail cleanly, it loops until the user gives up.
 def _resolve_llm(provider: str, token: str, model: Optional[str]):
     if provider == "openai":
-        return get_openai_clients(token, model or "gpt-4.1-mini")
+        return get_openai_clients(token, model or "gpt-5.6-sol")
     if provider == "gemini":
-        return get_gemini_clients(token, model or "gemini-2.5-flash")
+        return get_gemini_clients(token, model or "gemini-3.7-flash")
     if provider == "groq":
-        return get_groq_clients(token, model or "openai/gpt-oss-120b")
+        return get_groq_clients(token, model or "qwen/qwen3.6-27b")
     if provider == "claude":
-        return get_claude_client(token, model or "claude-haiku-4-5")
+        return get_claude_client(token, model or "claude-opus-5")
     raise ValueError(f"Unsupported provider: {provider}")
 
 
@@ -1208,8 +1271,22 @@ def _build_agent(llm, tools: list, lane: str = LANE_OPERATE,
         # Backstop for page *text*, which has no separable outcome line and so can only be
         # cleared wholesale. High trigger: a summary or a quote may legitimately need text
         # from several steps back, and unlike a stale map it does not go wrong with age.
+        #
+        # exclude_tools is not optional — without it this undoes TrimSupersededMaps above and
+        # re-creates the exact loop its docstring describes. ClearToolUsesEdit replaces a
+        # tool message's content with "[cleared]", and because it runs INSIDE the trim it
+        # lands on messages whose map is already gone, so the only thing left to destroy is
+        # `ok: clicked "..."` — the agent's sole memory of its own work. That is invisible on
+        # a one-step task and fatal on a multi-step one: the transcript crosses the trigger
+        # about two maps in, and from there the agent cannot see that it already opened the
+        # page it is standing on, so it opens it again.
+        #
+        # Trimmed act/goto results are ~20 tokens of outcome line, so excluding them costs
+        # almost nothing and leaves this aimed at what it was sized for: read_text and the
+        # retrieval tools, which are genuinely large and genuinely disposable.
         ContextEditingMiddleware(edits=[
-            ClearToolUsesEdit(trigger=TEXT_CLEAR_TRIGGER, keep=2),
+            ClearToolUsesEdit(trigger=TEXT_CLEAR_TRIGGER, keep=2,
+                              exclude_tools=("act", "goto")),
         ]),
     ]
 

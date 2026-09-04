@@ -72,6 +72,19 @@
          per-tab View model there. ── -->
     <div class="response-area" id="responseArea"></div>
 
+    <!-- ── What this thing does: stands in for the chat while it is empty.
+         A sibling of .response-area rather than a child, because that element is
+         opacity:0 until the first message arrives — anything inside it would be
+         invisible exactly when this needs to be read. Rows are built in popup.js,
+         which is where the page context and the Composio key are known. ── -->
+    <div class="intro" id="intro">
+      <div class="intro-inner">
+        <p class="intro-lead">Reads the page you’re on — and acts on it for you.</p>
+        <div class="intro-list" id="introList"></div>
+        <p class="intro-foot" id="introFoot"></p>
+      </div>
+    </div>
+
     <!-- ── First-run gate: shown instead of the chat until one LLM key exists.
          Toggled by the .needs-keys class on .popup-shell. ── -->
     <div class="setup-prompt" id="setupPrompt">
@@ -90,7 +103,7 @@
       <div class="input-card">
         <textarea
           id="query"
-          placeholder="Ask anything about this page…"
+          placeholder="Ask about this page, or tell it what to do…"
           rows="1"
         ></textarea>
 

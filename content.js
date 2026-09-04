@@ -333,7 +333,10 @@
     return line;
   }
 
-  function buildSnapshot() {
+  // The collection half of buildSnapshot, with none of its bookkeeping. Split out so the
+  // stability probe below counts exactly what a snapshot would list and cannot drift from
+  // it — a probe that measured something else would settle on the wrong signal.
+  function collectAll() {
     const found = [];
     const modal = activeModal();
     // Scope to the dialog when one is open, so the map describes what is actually
@@ -341,6 +344,11 @@
     collect(modal || document, found);
     // A dialog with nothing in it is not worth locking the map down to.
     if (modal && !found.length) collect(document, found);
+    return { found, modal };
+  }
+
+  function buildSnapshot(opts = {}) {
+    const { found, modal } = collectAll();
 
     state.elements = found.map((el) => {
       let id = state.handles.get(el);
@@ -376,6 +384,15 @@
                   'the rest of the page is behind it and cannot be clicked. ' +
                   'Close the dialog to reach the page again.');
     }
+    // Said out loud because a partial map is otherwise indistinguishable from a complete
+    // one: the two notices below only fire at zero elements and at the cap, so anything in
+    // between reads as the whole truth. It is not, on a page that was still drawing — and
+    // the acting rules tell the model to trust the map it was handed rather than re-read.
+    if (opts.provisional) {
+      header.push('(this page was STILL RENDERING when the map was taken, so controls that ' +
+                  'exist may be missing below and the line order may not be final. Before ' +
+                  'concluding anything is absent here, act with {"verb":"wait"} and look again)');
+    }
     if (!lines.length) {
       header.push('(no interactive elements found — the page may still be loading, ' +
                   'or its controls may be drawn on a canvas)');
@@ -406,6 +423,7 @@
       count: found.length,
       truncated: found.length >= MAX_ELEMENTS,
       scoped: state.scoped,
+      provisional: !!opts.provisional,
       unchanged,
       snapshot,
     };
@@ -420,6 +438,70 @@
 
   const SETTLE_QUIET_MS = 400;   // no mutations for this long counts as settled
   const SETTLE_MAX_MS   = 3000;  // an animating page never goes quiet; cap the wait
+
+  // A navigation gets its own, much longer budget, because it is a different problem. The
+  // settle above asks "did this click do anything", which 3s answers well. After a
+  // navigation the question is "has the new page finished drawing its controls", and on an
+  // app-shell site the answer is routinely no at 3s — the map comes back holding the
+  // masthead and the player while the buttons the task needs have not rendered.
+  const STABLE_STEP_MS  = 400;
+  const STABLE_MAX_MS   = 8000;
+  // Consecutive non-growing samples before calling it done. Two rather than one because
+  // progressive rendering plateaus: a single flat reading mid-render is common.
+  const STABLE_CALM     = 2;
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  // Wait until the page stops GROWING, then report whether it actually settled.
+  //
+  // Deliberately not a load check. The case this exists for is client-side navigation,
+  // where the document is never replaced: readyState stays "complete" from the previous
+  // page and chrome.tabs' status never leaves it either, so both say "loaded" while the
+  // view is still blank. Element count is the only honest signal available.
+  //
+  // Counting elements rather than watching mutations also matters — a page with a clock, a
+  // ticker or a live chat mutates forever and would always burn the full cap.
+  async function waitForStable() {
+    // ONE deadline for both phases below, not one each. Giving the parse wait its own full
+    // budget and then handing a fresh one to the stability loop means a slow-parsing page
+    // can be waited on for twice STABLE_MAX_MS, and the agent is holding a socket open the
+    // whole time. The cap is a promise about total latency, so it has to be measured once.
+    const deadline = Date.now() + STABLE_MAX_MS;
+
+    // A document that has not finished parsing has no stable map to wait for. This is the
+    // one place a load signal is the right one, and it only fires on real navigations.
+    if (document.readyState === 'loading') {
+      await new Promise((done) => {
+        let settled = false;
+        const finish = () => { if (!settled) { settled = true; done(); } };
+        document.addEventListener('DOMContentLoaded', finish, { once: true });
+        setTimeout(finish, Math.max(0, deadline - Date.now()));
+      });
+    }
+
+    let last = collectAll().found.length;
+    let calm = 0;
+
+    // Clamped to what is left rather than a flat step, so the cap is exact. Checking the
+    // deadline and only then sleeping a full step overshoots it by up to one step, and this
+    // number is the promise being made about worst-case latency — a click already spent up
+    // to SETTLE_MAX_MS before reaching here, and the socket is held open for the total.
+    for (;;) {
+      const left = deadline - Date.now();
+      if (left <= 0) break;
+      await sleep(Math.min(STABLE_STEP_MS, left));
+      const now = collectAll().found.length;
+      // Only growth resets the timer. A count that DROPPED is a page rearranging itself or
+      // unmounting what scrolled out of view, not one still filling in — waiting for it to
+      // climb back would stall on every site that virtualises a list.
+      if (now > last) calm = 0;
+      else calm += 1;
+      last = now;
+      if (calm >= STABLE_CALM) return { stable: true, count: now };
+    }
+
+    return { stable: false, count: last };
+  }
 
   class ActionError extends Error {}
 
@@ -743,6 +825,10 @@
     // opened a dialog it could not see reads exactly like a click that did nothing.
     const before = new Set(state.elements.map((e) => `${e.role}|${e.name}`));
     const wasScoped = state.scoped;
+    // The live location, not state.url. state.url is only refreshed by buildSnapshot, so
+    // comparing against it detects a navigation that happened BEFORE this batch (which is
+    // what `drift` above reports) and never the one this batch is about to cause.
+    const urlBefore = location.href;
     const watcher = watch();
 
     const results = [];
@@ -779,14 +865,33 @@
     }
 
     const why = await watcher.settle();
-    const fresh = buildSnapshot();
+
+    // The click navigated. The map is about to be replaced wholesale, so it is worth
+    // waiting for the new page to finish drawing rather than photographing it mid-render:
+    // this snapshot is the only thing the model gets, and the acting rules tell it to work
+    // from what an act returns instead of reading again. A map missing the button the task
+    // needs sends it down the recovery ladder for a control that was simply not there yet.
+    const navigated = location.href !== urlBefore;
+    const stability = navigated ? await waitForStable() : null;
+    const fresh = buildSnapshot({ provisional: stability ? !stability.stable : false });
 
     const after = state.elements.map((e) => `${e.role}|${e.name}`);
     const appeared = after.filter((k) => !before.has(k));
     const gone = before.size - (after.length - appeared.length);
 
     let changed;
-    if (fresh.scoped && !wasScoped) {
+    if (navigated) {
+      // Ahead of every other branch: after a navigation the appeared/gone diff is two
+      // unrelated pages subtracted from each other, and reporting "184 new, 176 gone"
+      // invites the model to read it as the old page having changed under it.
+      changed = `the page navigated to ${location.href} — this is a different page, so the ` +
+                'map below replaces everything you had and element numbers from before are ' +
+                'dead' +
+                (stability && !stability.stable
+                  ? '. It was still rendering when this was taken, so look again before ' +
+                    'deciding a control is missing'
+                  : '');
+    } else if (fresh.scoped && !wasScoped) {
       changed = `a dialog opened — the map below is its contents (${after.length} controls)`;
     } else if (wasScoped && !fresh.scoped) {
       changed = 'the dialog closed — the map below is the page again';
@@ -814,15 +919,34 @@
       // batch was wrong to attempt.
       drift: drift.length ? drift.join('; ') : null,
       settled: why,
+      navigated,
+      provisional: fresh.provisional,
       stopped_after: stoppedAfter,
       remaining: stoppedAfter === null ? 0 : actions.length - stoppedAfter - 1,
       generation: fresh.generation,
+      // NOTE: `unchanged` is deliberately still not forwarded, even though buildSnapshot
+      // computes it and formatActResult reads it. It has never been sent, so that whole
+      // "the map is unchanged, reuse your ids" path in the panel has never once run — an
+      // act result has always carried the full map. Switching it on is a real token saving
+      // and a genuinely untested code path, so it does not belong in a change whose whole
+      // subject is handing the model a trustworthy map. If it is ever enabled: it must be
+      // forced false when `navigated`, because every id was retired by the navigation.
       snapshot: fresh.snapshot,
     };
   }
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message?.type === 'SW_SNAPSHOT') {
+      // Opt-in, not the default. The caller that has just landed on a fresh page (a goto,
+      // or a click that triggered a real load) wants to wait for it to draw; read_page must
+      // stay immediate, because re-reading is the recovery move the acting rules lean on and
+      // making it slow would tax every attempt to get un-stuck.
+      if (message.waitForStable) {
+        waitForStable()
+          .then((s) => sendResponse(buildSnapshot({ provisional: !s.stable })))
+          .catch((err) => sendResponse({ ok: false, error: String(err?.message || err) }));
+        return true;
+      }
       try {
         sendResponse(buildSnapshot());
       } catch (err) {

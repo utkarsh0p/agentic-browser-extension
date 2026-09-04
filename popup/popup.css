@@ -95,6 +95,92 @@ body {
 .setup-btn:hover  { background: #2a2a2a; }
 .setup-btn:active { transform: scale(0.98); }
 
+/* ── Intro ───────────────────────────────────────────────────────────────────
+   Shown while the chat is empty, in place of the response area. `needs-keys`
+   outranks it below: with no key, the setup gate is the only thing to say. */
+.intro { display: none; }
+.popup-shell.chat-empty .response-area { display: none; }
+.popup-shell.chat-empty .intro {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+  align-items: center;
+  justify-content: center;
+  padding: 16px 18px;
+  overflow-y: auto;
+}
+.popup-shell.needs-keys .intro { display: none; }
+
+.intro-inner {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 10px;
+  width: 100%;
+  max-width: 320px;
+}
+
+.intro-lead {
+  font-size: var(--fs-sm);
+  color: #9a9a92;
+  line-height: 1.55;
+  text-align: center;
+  padding: 0 6px;
+}
+
+.intro-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.intro-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  width: 100%;
+  padding: 10px 11px;
+  border: 1px solid #ececea;
+  border-radius: 10px;
+  background: #ffffff;
+  font-family: 'Inter', sans-serif;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s, transform 0.1s;
+}
+.intro-row:hover  { border-color: #d8d8d2; background: #fdfdfc; }
+.intro-row:active { transform: scale(0.99); }
+
+.intro-ic {
+  flex: 0 0 auto;
+  display: flex;
+  margin-top: 1px;
+  color: #8a8a82;
+}
+.intro-row:hover .intro-ic { color: #1a1a1a; }
+
+.intro-meta { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+
+.intro-name {
+  font-size: var(--fs-base);
+  font-weight: 600;
+  color: #1a1a1a;
+}
+
+/* Wraps rather than truncating: a half-shown example teaches nothing. */
+.intro-eg {
+  font-size: var(--fs-sm);
+  color: #9a9a92;
+  line-height: 1.45;
+}
+
+.intro-foot {
+  font-size: var(--fs-xs);
+  color: #a8a8a0;
+  text-align: center;
+  padding-top: 2px;
+}
+
 /* ── Header ─────────────────────────────────────────────────────────────────── */
 
 .popup-header {
