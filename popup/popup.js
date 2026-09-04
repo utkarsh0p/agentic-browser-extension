@@ -1,6 +1,6 @@
 // ── Backend URL — toggle one line to switch between local and production ──────
-const BACKEND = 'http://localhost:5000';        // ← local testing
-//const BACKEND = 'https://api.cember.in';          // ← production
+//const BACKEND = 'http://localhost:5000';        // ← local testing
+const BACKEND = 'https://api.cember.in';          // ← production
 
 // ── Avatars ───────────────────────────────────────────────────────────────────
 
@@ -193,6 +193,8 @@ const KEY_HINTS = {
 
 const EYE_OPEN_ICON = `<svg class="eye-open" width="14" height="14" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg>`;
 const EYE_SHUT_ICON = `<svg class="eye-closed" style="display:none" width="14" height="14" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21"/></svg>`;
+
+const OUTLINK_ICON = `<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M7 17L17 7M7 7h10v10"/></svg>`;
 
 // Only models that can actually drive the page agent. The bar is not general
 // intelligence, it is four specific things this harness demands: nested-JSON tool calls
@@ -452,7 +454,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const ready = PROVIDER_ORDER.some(p => savedApiKeys[p]);
     shell.classList.toggle('needs-keys', !ready);
     input.disabled = !ready;
-    input.placeholder = ready ? 'Ask anything about this page…' : 'Add an API key to start';
+    input.placeholder = ready ? 'Ask about this page, or tell it what to do…' : 'Add an API key to start';
     refreshSendButton();
   }
 
@@ -1461,6 +1463,43 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
+  // ── About ─────────────────────────────────────────────────────────────────
+
+  // The version is read from the manifest, never written here. The store rejects an
+  // upload whose version was not bumped, so a literal in this file would sooner or later
+  // name a version that was never shipped — and this screen is the one place a user
+  // looks to find out what they are running.
+  function renderAboutScreen() {
+    const version = chrome.runtime.getManifest().version;
+
+    const wrap = document.createElement('div');
+    wrap.className = 'about';
+    wrap.innerHTML = `
+      <div class="about-block">
+        <div class="about-head">
+          <span class="about-app">SiteWhisper</span>
+          <span class="about-version">${escHtml(version)}</span>
+        </div>
+        <p class="about-body">Reads the page you’re on and acts on it — fills forms,
+           clicks through flows, looks things up.</p>
+        <p class="about-body">Runs on your own API key. Keys and chats stay in your
+           browser.</p>
+      </div>
+
+      <div class="about-rule"></div>
+
+      <div class="about-block">
+        <p class="about-label">Built by</p>
+        <p class="about-person">Utkarsh Singh</p>
+        <p class="about-roles">AI Engineer · Web Developer · Software Engineer</p>
+        <p class="about-roles">Agentic enthusiast</p>
+        <a class="about-link" href="https://github.com/utkarsh0p"
+           target="_blank" rel="noopener">${OUTLINK_ICON}github.com/utkarsh0p</a>
+      </div>`;
+
+    overlayList.appendChild(wrap);
+  }
+
   // ── Overlay ────────────────────────────────────────────────────────────────
 
   function showOverlay(mode, prevMode = null) {
@@ -1477,6 +1516,11 @@ document.addEventListener('DOMContentLoaded', () => {
           icon: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="5" width="20" height="14" rx="2"/><path d="M2 10h20"/></svg>`,
           label: 'API Keys', sub: 'Providers and tools',
           action: () => showOverlay('keys', 'menu'),
+        },
+        {
+          icon: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 11.5v4.5"/><path d="M12 7.75h.01"/></svg>`,
+          label: 'About', sub: 'Version and credits',
+          action: () => showOverlay('about', 'menu'),
         },
       ];   // Clear Chat lives in the header now, not in here
 
@@ -1503,6 +1547,10 @@ document.addEventListener('DOMContentLoaded', () => {
     } else if (mode === 'keys') {
       overlayTitle.textContent = 'API Keys';
       renderKeysScreen();
+
+    } else if (mode === 'about') {
+      overlayTitle.textContent = 'About';
+      renderAboutScreen();
 
     } else if (mode === 'provider') {
       overlayTitle.textContent = 'Choose Provider';

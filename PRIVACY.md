@@ -1,38 +1,84 @@
 # Privacy Policy — SiteWhisper
 
-**Last updated:** June 26, 2026
+**Last updated:** September 4, 2026
 
-## What data does SiteWhisper collect?
+## What data does SiteWhisper read?
 
-SiteWhisper reads the visible text content of the webpage you are currently viewing only when you actively ask a question through the extension popup. This data is not collected in the background or without your action.
+SiteWhisper reads the page you are viewing only when you send it a message. Nothing is read in
+the background, and nothing is read on pages you never ask about.
+
+Two things are read:
+
+- **The visible text** of the page, when answering a question needs it.
+- **An element map** — a list of the page's interactive controls (buttons, links, form fields),
+  giving each one its role, its visible label, and its current state.
+
+**Passwords and other secret fields are never sent.** The element map reports only that a field
+has a value and how many characters it is, never the value itself.
+
+## What SiteWhisper does on your behalf
+
+SiteWhisper is not only a reader. When you ask it to do something, it can click, type, select,
+check boxes, submit forms, and navigate — in the tab you asked from. It does not open or switch
+tabs.
+
+This can include acting inside sites where you are already signed in. You stay in control of it:
+
+- **Restricted mode is the default.** In it, SiteWhisper asks for your approval before submitting
+  a form, before clicking anything named like a consequential action (delete, buy, pay, send, and
+  similar), and before typing into a password or payment field.
+- **Unrestricted mode** runs those page actions without asking. It applies to page actions only,
+  it is never remembered, and closing the panel always returns you to Restricted.
+- **Actions in outside services** — sending an email through a connected account, for example —
+  ask for approval in either mode.
+
+When it needs a value it does not have, it asks you. Anything you type into such a prompt stays
+in your browser: it is inserted into the page at the moment of typing, is never sent to the AI
+model, and is never written to your saved conversation.
 
 ## How is the data used?
 
-The page text and your question are sent to our backend server (api.cember.in) to find the most relevant sections of the page and generate an AI-powered answer. Page text is not stored, logged, or retained after the response is returned.
+Your message, along with the page text or element map it needs, is sent to our backend server
+(api.cember.in), which passes it to the AI provider you selected using your own API key. It is
+used to produce that one answer or action. Page content is not stored, logged, or retained after
+the response is returned.
+
+No conversation history is sent to the AI model. Each message is handled on its own.
 
 ## API keys
 
-Your API keys (for Claude, Gemini, or OpenAI) are stored locally in your browser using chrome.storage.local. They are sent to our backend server only to authenticate requests with the respective AI provider — they are never logged or stored on our server.
+Your API keys (for Claude, Gemini, GPT, or Groq) are stored locally in your browser using
+`chrome.storage.local`. They are sent to our backend server only to authenticate requests with
+that AI provider — they are never logged or stored on our server.
 
-An optional Composio tool key is also stored locally and sent to our backend only when those tools are used during a session.
+An optional Composio key is stored the same way, and sent only when those tools are used.
 
 ## Third-party services
 
-When you ask a question, the page content and your query may be processed by the following services depending on your configuration:
+Depending on your configuration, your message and the page content may be processed by:
 
-- **Anthropic** (Claude), **Google** (Gemini), or **OpenAI** (GPT) — for generating AI answers
-- **Composio** — for app integrations (Gmail, Google Docs, etc.), if you provide a Composio API key
+- **Anthropic** (Claude), **Google** (Gemini), **OpenAI** (GPT), or **Groq** — to generate
+  answers and decide actions
+- **Composio** — for actions in connected apps (Gmail, Google Docs, and others), only if you
+  provide a Composio API key
 
 Each provider's own privacy policy applies to that interaction.
 
 ## Chat history
 
-Chat messages are stored locally in your browser using chrome.storage.local to persist conversations across popup sessions. This data never leaves your browser and is cleared automatically when you navigate to a different page or manually clear the chat.
+Your conversation is stored locally in your browser using `chrome.storage.local`, as one entry
+per browser window. It stays as you browse — navigating, switching tabs, and opening or closing
+tabs do not clear it — so that a conversation survives the work you are doing.
+
+It is removed when you close that browser window, when you start a new chat, and whenever you
+clear it yourself. Because it is keyed to a window, it does not survive restarting your browser.
+This data never leaves your browser.
 
 ## Data sharing
 
-SiteWhisper does not sell, share, or transfer user data to any third party for advertising, analytics, or any purpose unrelated to the extension's core functionality.
+SiteWhisper does not sell, share, or transfer user data to any third party for advertising,
+analytics, or any purpose unrelated to the extension's core functionality.
 
 ## Contact
 
-If you have questions about this privacy policy, contact: utkarshdevendrasingh@gmail.com 
+If you have questions about this privacy policy, contact: utkarshdevendrasingh@gmail.com
