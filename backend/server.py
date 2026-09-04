@@ -188,6 +188,20 @@ PROMPT_ESCALATE = (
     "action, and never guess at page content you were not given."
 )
 
+# Attached by lane rather than by tool: Composio names its tools at runtime, so they never
+# appear in CAPABILITIES and DEFAULT_CAP carries no fragment. Without this the app lane's
+# whole prompt was PROMPT_BASE plus a page hint — nothing said the tools were meta-tools,
+# so the model had to infer the search → connect → execute protocol from schemas alone.
+PROMPT_APPS = (
+    "Connected apps: your tools reach the user's own accounts — email, calendar, files, "
+    "chat and the like. They are meta-tools: the action you want is a parameter, not a "
+    "tool name. Search for the tool that fits the request, then execute it by its slug. "
+    "If the account is not connected yet, start the connection and give the user the link "
+    "that comes back — then stop and let them open it.\n\n"
+    "You have these tools right now, so never tell the user you cannot reach their apps. "
+    "If something genuinely will not work, say what you tried and what came back."
+)
+
 
 # ── Lane + capability registry ────────────────────────────────────────────────
 # One declaration per tool decides three things at once: which lanes may offer it, what
@@ -231,12 +245,21 @@ LANES: dict[str, Lane] = {
         needs_browser=True,
     ),
     LANE_APP: Lane(
-        # "not looking at" is the whole distinction. Without it, "delete the first mail"
-        # routed here purely because it says mail — while the user was sitting on Gmail
-        # with the mail in front of them — and the turn spent a model call escalating.
-        description=("an action in an outside service the user is NOT currently looking "
-                     "at, reached through a connected account rather than through the "
-                     "page in front of them"),
+        # Described by the services it covers, not by "one the user is not looking at".
+        # The router is deliberately page-blind (see _router_input), so a page-relative
+        # test is the one thing it cannot evaluate: "can you send mail" fell to operate,
+        # which holds no mail tool and — being the single lane outside ESCALATING_LANES —
+        # cannot hand the turn on. It refused, in one step, with a Composio key set.
+        #
+        # The previous wording guarded the opposite case: "delete the first mail" while
+        # sitting in Gmail landing here. That still happens, and it is the error worth
+        # having — this lane carries `escalate`, so it costs one model call and recovers,
+        # while a wrong turn into operate is terminal. The bias toward app is deliberate.
+        description=("an action in a connected external service — email, calendar, files, "
+                     "chat, notes, issue tracker — carried out through the user's account. "
+                     "Choose this when the request names or implies such a service (send an "
+                     "email, add an event, message someone) and does not point at the page "
+                     "in front of them"),
         needs_app_key=True,
     ),
 }
@@ -290,7 +313,7 @@ _SNAP_HEADER = {"page": re.compile(r'^page:\s*(.+)$', re.M),
                 "url":  re.compile(r'^url:\s*(.+)$',  re.M)}
 
 
-def _page_hint(snapshot: str) -> str:
+def _page_hint(snapshot: str, lane: str = LANE_OPERATE) -> str:
     """One line naming the page the user is on, from the map header the panel already sends.
 
     Costs ~20 tokens and removes a whole class of stall: without it the agent cannot tell
@@ -304,12 +327,20 @@ def _page_hint(snapshot: str) -> str:
     if not (title or url):
         return ""
     where = " — ".join(x.group(1).strip() for x in (title, url) if x)
+    if lane == LANE_APP:
+        # This lane's tools reach the user's connected accounts, not the tab in front of
+        # them, so the sentence below is false here — and saying it produced exactly the
+        # refusal it sounds like: "I can only interact with the webpage that's currently
+        # open", in answer to a request its Composio tools could have served.
+        return (f"The user is looking at this page right now: {where}\n"
+                "That is background only. Your tools act on their connected accounts, not "
+                "on this page — use it only if the request refers to what they are viewing.")
     return (f"The user is looking at this page right now: {where}\n"
             "That is the page your tools act on. You do not need to ask which page they "
             "mean, and you do not need its address to work on it.")
 
 
-def _lane_prompt(tools: list, page_hint: str = "") -> str:
+def _lane_prompt(tools: list, page_hint: str = "", lane: str = LANE_OPERATE) -> str:
     """Compose the system prompt from the tools this lane actually received."""
     have  = {getattr(t, "name", "") for t in tools}
     order = [n for n in PROMPT_SEQUENCE if n in CAPABILITIES]
@@ -318,6 +349,12 @@ def _lane_prompt(tools: list, page_hint: str = "") -> str:
     parts, seen = [PROMPT_BASE], {PROMPT_BASE}
     if page_hint:
         parts.append(page_hint)
+    # Early, with the other "what to do" guidance: PROMPT_ESCALATE closes the prompt and
+    # says the page is off limits, which reads as a dead end unless what IS possible has
+    # already been stated. Keyed on the lane because Composio's tool names are not known
+    # until runtime — see PROMPT_APPS.
+    if lane == LANE_APP:
+        parts.append(PROMPT_APPS)
     for name in order:
         fragment = CAPABILITIES[name].prompt
         # Identity check, not equality: two tools may legitimately share one fragment and
@@ -604,14 +641,22 @@ def _resolve_llm(provider: str, token: str, model: Optional[str]):
 # Auth failures only. Deliberately NOT a bare "invalid" match: OpenAI-compatible
 # APIs label a missing model `"type": "invalid_request_error"`, so a substring test
 # on "invalid" reports a working key as a bad one and hides the real cause.
+#
+# No bare "401" here, for exactly the reason _RATE_MARKERS carries no bare "429": it
+# occurs inside hex request ids — roughly 1 in 140 of them — so an unrelated upstream
+# failure would report itself as a bad API key. The status code states the same fact
+# without the guessing, so match on that instead.
 _AUTH_MARKERS = (
     "invalid api key", "invalid_api_key", "incorrect api key", "invalid x-api-key",
     "api key not valid", "no api key", "missing api key", "api_key",
-    "authentication", "unauthorized", "permission denied", "401",
+    "authentication", "unauthorized", "permission denied",
 )
+_AUTH_STATUS = frozenset({401, 403})
 
 
 def _is_auth_error(e: Exception) -> bool:
+    if getattr(e, "status_code", None) in _AUTH_STATUS:
+        return True
     msg = str(e).lower()
     return any(k in msg for k in _AUTH_MARKERS)
 
@@ -656,7 +701,21 @@ def _rate_limit_message(provider: str, e: Optional[Exception] = None) -> str:
             "provider lifts it.")
 
 
+class ComposioUnavailable(Exception):
+    """Composio would not hand over its tools.
+
+    A tag, not a message carrier: Composio's failures are indistinguishable from the
+    LLM's by text alone — both say "invalid api key" and both are 401 — but the handlers
+    below only know the *model* provider's name. Without this, a rejected Composio key
+    reports itself as "Invalid API key for claude" and sends the user to check a key that
+    was never the problem.
+    """
+
+
 def _sse_error_handler(e: Exception, provider: str) -> str:
+    # First, because `provider` names the model and this failure did not come from it.
+    if isinstance(e, ComposioUnavailable):
+        return str(e)
     if _is_auth_error(e):
         return f"Invalid API key for {provider}. Check your key in Settings."
     if _is_rate_limit_error(e):
@@ -971,8 +1030,12 @@ def _route_instructions(lanes: list[str]) -> str:
     return (
         "Classify what the user wants so it can be handled by the right tools. "
         "Choose exactly one option.\n\n" + "\n".join(lines) + "\n\n"
+        # "the option that does things" was written when only one option acted. With a
+        # Composio key two of them do, and the phrase then points at whichever description
+        # carries the most action verbs — operate — regardless of where the work belongs.
         "Judge the request on its own. If it asks for something to be done rather than "
-        "answered, choose the option that does things."
+        "answered, choose the option that does it — and when more than one option acts, "
+        "pick the one matching where the work happens, not merely that work is involved."
     )
 
 
@@ -1238,9 +1301,20 @@ def _build_tools(body: "ChatRequest", client_call=None, lane: str = LANE_OPERATE
     if composio_key:
         from composio import Composio
         from composio_langchain import LangchainProvider
-        composio = Composio(api_key=composio_key, provider=LangchainProvider())
-        session = composio.create(user_id="default")
-        tools.extend(session.tools())
+        try:
+            composio = Composio(api_key=composio_key, provider=LangchainProvider())
+            session = composio.create(user_id="default")
+            tools.extend(session.tools())
+        except Exception as e:
+            # Tagged and re-raised rather than swallowed. Continuing without the tools
+            # would hand the app lane an empty toolset — the dead turn `needs_app_key`
+            # exists to prevent — and the model would apologise instead of naming the
+            # one thing the user can actually fix.
+            raise ComposioUnavailable(
+                "Invalid Composio key. Check it in Settings."
+                if _is_auth_error(e)
+                else f"Composio is unreachable, so connected apps are unavailable: {e}"
+            ) from e
 
     # The registry, not a branch per lane, decides what this turn is allowed to hold.
     return [t for t in tools if lane in _cap(getattr(t, "name", "")).lanes]
@@ -1305,7 +1379,7 @@ def _build_agent(llm, tools: list, lane: str = LANE_OPERATE,
     return create_agent(
         model=llm,
         tools=tools,
-        system_prompt=_lane_prompt(tools, page_hint),
+        system_prompt=_lane_prompt(tools, page_hint, lane),
         middleware=middleware,
         checkpointer=checkpointer,
     )
@@ -1607,7 +1681,13 @@ async def chat(
     # text the panel included.
     usage      = Usage()
     lane, _err = await _route(llm, body, allow_browser=False, usage=usage)
-    tools      = _build_tools(body, None, lane, provider=provider, token=token)
+    # Composio is the only tool source here that talks to the network while being built,
+    # so it is the only one that can fail this early. Unhandled it became a bare 500 with
+    # no detail, which is worse than the socket path's wrong-but-specific message.
+    try:
+        tools = _build_tools(body, None, lane, provider=provider, token=token)
+    except ComposioUnavailable as e:
+        raise HTTPException(status_code=502, detail=str(e))
     messages   = _build_messages(body.query)
 
     # No escalation on this transport. It would need a second pass mid-stream, and the
@@ -1618,7 +1698,7 @@ async def chat(
         frames = _stream_chat(llm, messages, LLM_TIMEOUT, provider, usage=usage)
     else:
         agent  = _build_agent(llm, tools, lane,
-                              page_hint=_page_hint(body.snapshot))
+                              page_hint=_page_hint(body.snapshot, lane))
         frames = _stream_agent(agent, messages, LLM_TIMEOUT, provider, usage=usage)
 
     return StreamingResponse(_sse(_with_route(lane, frames)), media_type="text/event-stream")
@@ -1786,7 +1866,7 @@ async def chat_ws(ws: WebSocket):
                 agent = _build_agent(
                     llm, tools, lane,
                     interrupt_on=_hitl_config(body.mode, [t.name for t in tools], page),
-                    page_hint=_page_hint(body.snapshot),
+                    page_hint=_page_hint(body.snapshot, lane),
                     # Interrupts need checkpointing. In-memory is right here and not a
                     # compromise: the run lives and dies with this connection, which pins
                     # it to one worker, so nothing has to be shared across processes.
