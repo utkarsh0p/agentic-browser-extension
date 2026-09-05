@@ -181,6 +181,19 @@ PROMPT_RETRIEVAL = (
     "'what is this about'."
 )
 
+# Not a capability fragment: this belongs to a TRANSPORT, not to a tool, so it is passed in
+# rather than registered in CAPABILITIES. Deliberately not PROMPT_ESCALATE — that one tells
+# the model to call escalate, and on this path escalate does not exist to be called.
+PROMPT_NO_BROWSER = (
+    "Page actions are unavailable on this turn. The panel could not open the connection "
+    "that runs them, so you have no click, type or navigate tool and no way to obtain one. "
+    "Answer what you can from the page text you were given and from your own knowledge.\n\n"
+    "If the request was for something to be DONE, lead with the fact that you could not do "
+    "it and why — the connection the page tools need was unavailable — and say it is worth "
+    "trying again in a moment. You may give the manual steps after that, but never open "
+    "with them, and never describe any step as though you carried it out."
+)
+
 PROMPT_ESCALATE = (
     "You cannot act on the page in this turn — you have no click, type or navigate tool. "
     "The moment the request needs one, call escalate with a one-line reason and stop; the "
@@ -296,8 +309,13 @@ def _page_hint(snapshot: str) -> str:
             "mean, and you do not need its address to work on it.")
 
 
-def _lane_prompt(tools: list, page_hint: str = "") -> str:
-    """Compose the system prompt from the tools this lane actually received."""
+def _lane_prompt(tools: list, page_hint: str = "", transport_note: str = "") -> str:
+    """Compose the system prompt from the tools this lane actually received.
+
+    `transport_note` is a constraint on the whole turn rather than guidance for a tool, so
+    it is appended last — where the tuned PROMPT_SEQUENCE puts whatever should be freshest,
+    and where nothing composed from the registry can bury it.
+    """
     have  = {getattr(t, "name", "") for t in tools}
     order = [n for n in PROMPT_SEQUENCE if n in CAPABILITIES]
     order += [n for n in CAPABILITIES if n not in order]
@@ -312,6 +330,8 @@ def _lane_prompt(tools: list, page_hint: str = "") -> str:
         if fragment and name in have and fragment not in seen:
             parts.append(fragment)
             seen.add(fragment)
+    if transport_note:
+        parts.append(transport_note)
     return "\n\n".join(parts)
 
 
@@ -1236,7 +1256,7 @@ def _build_tools(body: "ChatRequest", client_call=None, lane: str = LANE_OPERATE
 
 def _build_agent(llm, tools: list,
                  interrupt_on: Optional[dict] = None, checkpointer=None,
-                 page_hint: str = ""):
+                 page_hint: str = "", transport_note: str = ""):
     """create_agent (langchain>=1) over langgraph's create_react_agent: the same
     tool-calling loop, but it accepts middleware. Order matters — first listed is
     outermost, so the call limits sit outside everything and cannot be bypassed.
@@ -1293,7 +1313,7 @@ def _build_agent(llm, tools: list,
     return create_agent(
         model=llm,
         tools=tools,
-        system_prompt=_lane_prompt(tools, page_hint),
+        system_prompt=_lane_prompt(tools, page_hint, transport_note),
         middleware=middleware,
         checkpointer=checkpointer,
     )
@@ -1621,8 +1641,14 @@ async def chat(
     if not tools:
         frames = _stream_chat(llm, messages, LLM_TIMEOUT, provider, usage=usage)
     else:
+        # Every turn on this transport is missing the page verbs, and without being told so
+        # the model does not know it: it read the controls, found no way to use them, and
+        # answered "here is how YOU can do it" — which reads as the product refusing rather
+        # than as a connection that could not be opened. The panel already says this in the
+        # rail; this makes the answer agree with it.
         agent  = _build_agent(llm, tools,
-                              page_hint=_page_hint(body.snapshot))
+                              page_hint=_page_hint(body.snapshot),
+                              transport_note=PROMPT_NO_BROWSER)
         frames = _stream_agent(agent, messages, LLM_TIMEOUT, provider, usage=usage)
 
     return StreamingResponse(_sse(_with_route(lane, frames)), media_type="text/event-stream")

@@ -11,8 +11,11 @@
 (() => {
   'use strict';
 
-  // Injected both declaratively (manifest) and on demand (executeScript, for tabs that
-  // predate the extension loading). Re-running would reset live element refs, so bail.
+  // Injected on demand only, via executeScript — the manifest declares no content script,
+  // so nothing runs on a page until the user actually asks something of it. That makes a
+  // second injection into the same page ordinary rather than exceptional: the panel
+  // re-injects whenever a send finds no receiver. Re-running would reset live element
+  // refs, and the handles in the map the model is holding would stop resolving, so bail.
   if (window.__siteWhisper) return;
 
   const MAX_ELEMENTS   = 200;   // beyond this the snapshot costs more than it's worth

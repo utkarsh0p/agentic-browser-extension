@@ -128,11 +128,16 @@ const ROUTE_LABELS = {
 // Provider keys live in storage under `apiKeys`. Carried over from the options
 // page this panel replaced.
 
+// `freeTier` marks the two providers a key actually works on without billing. Google and
+// Groq run ongoing free tiers; Anthropic and OpenAI give a one-time trial credit and then
+// require a payment method, which is indistinguishable from a free tier until it runs out.
+// Marked at the provider, not the model: under a free-tier provider every model listed here
+// is free, so a per-model badge would repeat itself down the whole picker.
 const KEY_HINTS = {
   claude:   { placeholder: 'sk-ant-api03-…', host: 'console.anthropic.com',  url: 'https://console.anthropic.com/',       prefix: 'sk-ant-' },
-  gemini:   { placeholder: 'AIzaSy…',        host: 'aistudio.google.com',    url: 'https://aistudio.google.com/apikey',   prefix: 'AIza'    },
+  gemini:   { placeholder: 'AIzaSy…',        host: 'aistudio.google.com',    url: 'https://aistudio.google.com/apikey',   prefix: 'AIza',    freeTier: true },
   openai:   { placeholder: 'sk-proj-…',      host: 'platform.openai.com',    url: 'https://platform.openai.com/api-keys', prefix: 'sk-'     },
-  groq:     { placeholder: 'gsk_…',          host: 'console.groq.com',       url: 'https://console.groq.com/keys',        prefix: 'gsk_'    },
+  groq:     { placeholder: 'gsk_…',          host: 'console.groq.com',       url: 'https://console.groq.com/keys',        prefix: 'gsk_',    freeTier: true },
 };
 
 const EYE_OPEN_ICON = `<svg class="eye-open" width="14" height="14" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg>`;
@@ -153,10 +158,12 @@ const OUTLINK_ICON = `<svg width="11" height="11" viewBox="0 0 24 24" fill="none
 // provider's first entry in step with _resolve_llm's default in server.py.
 const MODELS = {
   openai: [
+    { id: 'gpt-6-astra',   label: 'GPT-6 Astra'   },
     { id: 'gpt-5.6-sol',   label: 'GPT-5.6 Sol'   },
     { id: 'gpt-5.6-terra', label: 'GPT-5.6 Terra' },
   ],
   gemini: [
+    { id: 'gemini-3.8-flash', label: 'Gemini 3.8 Flash' },
     { id: 'gemini-3.7-flash', label: 'Gemini 3.7 Flash' },
     { id: 'gemini-3.6-flash', label: 'Gemini 3.6 Flash' },
   ],
@@ -164,20 +171,31 @@ const MODELS = {
   // tool calls on a task Qwen completed, and 20B is the same model with less to work with.
   // groq/compound is excluded on architecture rather than quality: it brings its own
   // built-in web search and code execution, which fights a tool surface whose whole point
-  // is acting on the page the user is already looking at.
+  // is acting on the page the user is already looking at. minimax-m2.7 is excluded for
+  // neither reason — it is Enterprise-only on GroqCloud, so a free or developer key cannot
+  // reach it at all, and listing it would offer a model most users cannot select.
   //
-  // Caveat: qwen3.6-27b is preview status on GroqCloud, and Groq does retire preview
-  // models (Llama 3.1 8B and 3.3 70B went on 2026-06-17). If it disappears, this provider
-  // has no replacement that has been shown to work here.
+  // Caveat, unchanged in kind by there now being two: BOTH Qwen entries are preview status,
+  // and Groq does retire preview models (Llama 3.1 8B and 3.3 70B went on 2026-06-17). 3.6
+  // is kept as the fallback for 3.8 disappearing, but a retirement sweep takes both and
+  // leaves this provider with nothing shown to work here.
   groq: [
+    { id: 'qwen/qwen3.8-27b', label: 'Qwen3.8 27B' },
     { id: 'qwen/qwen3.6-27b', label: 'Qwen3.6 27B' },
   ],
   // Opus 5 and Sonnet 5 are the only Claude models that reason without a code change:
-  // get_claude_client passes no `thinking` parameter, and omitting it means adaptive
-  // thinking on the 5 family but nothing at all on Haiku 4.5 / Sonnet 4.6 / Opus 4.6 —
-  // which is the same reasoning-off state that made GPT-OSS 120B thrash. Fable 5 is
-  // deliberately absent: always-on thinking and turns that can run minutes are wrong for
-  // a side panel, whatever they do for quality.
+  // get_claude_client passes no `thinking` parameter, and Anthropic lists exactly these two
+  // (of the models worth using here) as having thinking already on and needing no
+  // configuration. Omitting it elsewhere means no reasoning at all — the same reasoning-off
+  // state that made GPT-OSS 120B thrash.
+  //
+  // Opus 4.8 and 4.7 look like free additions and are not: they support adaptive thinking
+  // but are NOT in that on-by-default set, so listing them means passing
+  // thinking={"type":"adaptive"} from get_claude_client. At identical pricing to Opus 5
+  // ($5/$25) that buys nothing, so the code change was not made and they stay out.
+  //
+  // Fable 5 is deliberately absent for a different reason: always-on thinking and turns
+  // that can run minutes are wrong for a side panel, whatever they do for quality.
   claude: [
     { id: 'claude-opus-5',   label: 'Claude Opus 5'   },
     { id: 'claude-sonnet-5', label: 'Claude Sonnet 5' },
@@ -231,21 +249,95 @@ async function readSSEStream(response, handlers) {
 // unrestricted has to be a fresh decision each time, never something left on by accident.
 let agentMode = 'restricted';
 
-// Raised when the socket never opened, which is the one case worth retrying over POST:
-// an older backend, or a proxy that drops upgrades. A socket that opens and then fails is
-// a real error and must surface as one.
+// Raised when the socket never opened — an older backend, or a proxy that drops upgrades.
+// The only failure for which POST is even a candidate, and then only until a socket has
+// opened once (see wsProven). A socket that opens and then fails is a real error and must
+// surface as one, never as a downgrade.
 class TransportUnavailable extends Error {}
 
-// A backend without /chat/ws refuses the upgrade, but a proxy that blackholes it just
-// hangs — so waiting for the browser's own timeout is not an option.
-const WS_CONNECT_TIMEOUT_MS = 2500;
-// …and once it has failed, stop paying that cost on every single question. Re-armed after
-// a while so a backend deployed mid-session is picked up without a reload.
-const WS_RETRY_AFTER_MS = 10 * 60 * 1000;
-let wsUnavailableUntil = 0;
+// A backend without /chat/ws refuses the upgrade, but a proxy that blackholes it just hangs,
+// so the browser's own timeout is no help. The hard part is that a *sleeping* backend looks
+// identical to an absent one from here, and the two want opposite responses: wait longer
+// versus give up and downgrade. One constant cannot serve both — 2500ms was chosen for the
+// absent case and, on a free-tier host that spins down when idle, silently downgraded every
+// first question of the day to a transport that cannot act on the page.
+//
+// So the budget is sized from evidence instead of guessed: if the backend has answered us
+// over plain HTTP recently it is awake, and a slow upgrade really does mean a missing one.
+const WS_TIMEOUT_AWAKE_MS = 5000;
+const WS_TIMEOUT_COLD_MS  = 15000;
+// A warm handshake to a free-tier host measures ~1.0–1.7s, so 5000 leaves real headroom
+// rather than the ~800ms 2500 left.
+const AWAKE_TTL_MS = 5 * 60 * 1000;
+// Once the socket has genuinely failed, stop paying that cost on every question — but keep
+// the penalty short, because this is a guess and a wrong one costs the user page actions.
+const WS_RETRY_AFTER_MS = 2 * 60 * 1000;
 
+let wsUnavailableUntil = 0;
+// Any response at all from the backend, including a 404: it came from the app, so the app is
+// serving. Expiring on its own is what lets a panel left open while the host idles back down
+// return to the cold budget without polling anything.
+let lastBackendContact = 0;
+// Set the first time a socket opens. From then on we KNOW this backend speaks WebSocket, so
+// a later failure is transient and downgrading to POST would be a strictly worse answer.
+//
+// Mirrored into storage, because this is proof about the BACKEND, not about this panel
+// session. As a plain variable it reset on every panel close, so the first question after
+// every reopen was a downgrade candidate again: one slow handshake and that turn silently
+// lost every page verb. That is the whole of "sometimes it opens the video, sometimes it
+// explains how to open it" — same model, same route, different transport. Keyed by BACKEND
+// so pointing the panel elsewhere does not inherit proof about a different server.
+let wsProven = false;
+const WS_PROVEN_KEY = `wsProven:${BACKEND}`;
+
+// Restored at startup, before the first question can be sent. A storage failure is silent
+// and costs at most one connect attempt — exactly the behaviour of a never-proven backend.
+async function loadWsProven() {
+  try {
+    const res = await chrome.storage.local.get([WS_PROVEN_KEY]);
+    if (res[WS_PROVEN_KEY]) wsProven = true;
+  } catch { /* storage unavailable: keep the in-memory default */ }
+}
+
+// Called on every socket open, so it guards against re-writing what is already stored.
+function rememberWsProven() {
+  if (wsProven) return;
+  wsProven = true;
+  try { chrome.storage.local.set({ [WS_PROVEN_KEY]: true }); } catch { /* best effort */ }
+}
+
+function noteBackendContact() { lastBackendContact = Date.now(); }
+function backendAwake()  { return Date.now() - lastBackendContact < AWAKE_TTL_MS; }
+function wsConnectBudget() { return backendAwake() ? WS_TIMEOUT_AWAKE_MS : WS_TIMEOUT_COLD_MS; }
 function wsWorthTrying() { return Date.now() >= wsUnavailableUntil; }
-function markWsUnavailable() { wsUnavailableUntil = Date.now() + WS_RETRY_AFTER_MS; }
+
+// Only a backend that was demonstrably AWAKE gets written off. The distinction is the
+// whole value of this function: a handshake that fails against a host we know is serving
+// HTTP is evidence about the backend — it is up and it refused the upgrade — and skipping
+// the socket for a while is right. A handshake that fails against a cold host is evidence
+// of nothing but the cold, and on a free-tier box the failed attempt is itself part of what
+// wakes it, so the next question is the one MOST likely to connect. Penalising that window
+// is exactly backwards, and it is what produced "I cleared the chat and it still says
+// reading-only": the timer set by the cold-start miss outlived the condition that set it,
+// and the following turns skipped the socket without even trying it. Clearing a chat never
+// touched this, because it is transport state and has nothing to do with the conversation.
+//
+// Cost of the narrower rule: a backend genuinely without /chat/ws pays one extra connect
+// timeout — the first turn is cold, so it is exempt — and is written off from the second.
+function markWsUnavailable() {
+  if (!backendAwake()) return;
+  wsUnavailableUntil = Date.now() + WS_RETRY_AFTER_MS;
+}
+
+// Free-tier hosts spin down when idle and the first request pays the whole spin-up. Firing
+// this the moment the panel opens spends that wait while the user is still typing, so the
+// first question meets a backend that is already up. Fire-and-forget on purpose: a failure
+// here means the next real request will be slow, not that anything is wrong to report.
+function wakeBackend() {
+  fetch(`${BACKEND}/health`, { method: 'GET', cache: 'no-store' })
+    .then(noteBackendContact)      // a 404 counts — an old backend still answered it
+    .catch(() => {});
+}
 
 // The socket exists so page tools can run in the browser mid-turn: the server sends a
 // `client_tool` frame and waits for the matching `client_tool_result`, which keeps the
@@ -256,10 +348,14 @@ function runWsQuery(payload, handlers, signal) {
     let ws;
     try { ws = new WebSocket(url); } catch (err) { reject(new TransportUnavailable(err.message)); return; }
 
-    let opened = false, settled = false;
+    // `streamEnded` is the difference between a turn that finished and a socket that died
+    // holding one: without it, onclose below resolved either way and a dropped connection
+    // was indistinguishable from a complete answer — truncated output, no error, nothing
+    // to report. Set only by dispatchFrame returning true, i.e. a real `done` or `error`.
+    let opened = false, settled = false, streamEnded = false;
     const openTimer = setTimeout(() => {
       if (!opened) finish(new TransportUnavailable('socket did not open in time'));
-    }, WS_CONNECT_TIMEOUT_MS);
+    }, wsConnectBudget());
 
     const finish = (err) => {
       if (settled) return;
@@ -272,7 +368,16 @@ function runWsQuery(payload, handlers, signal) {
     const onAbort = () => finish(new DOMException('aborted', 'AbortError'));
     signal?.addEventListener('abort', onAbort, { once: true });
 
-    ws.onopen = () => { opened = true; clearTimeout(openTimer); ws.send(JSON.stringify(payload)); };
+    ws.onopen = () => {
+      opened = true;
+      // Proof, not a hint: this backend has /chat/ws, so no later failure justifies
+      // downgrading to a transport that cannot act on the page. Recorded in storage so the
+      // proof survives the panel being closed.
+      rememberWsProven();
+      noteBackendContact();
+      clearTimeout(openTimer);
+      ws.send(JSON.stringify(payload));
+    };
 
     ws.onmessage = async (ev) => {
       let parsed;
@@ -308,11 +413,18 @@ function runWsQuery(payload, handlers, signal) {
         return;
       }
 
-      if (dispatchFrame(parsed, handlers)) finish();
+      if (dispatchFrame(parsed, handlers)) { streamEnded = true; finish(); }
     };
 
     ws.onerror  = () => { if (!opened) finish(new TransportUnavailable('socket error')); };
-    ws.onclose  = () => finish(opened ? undefined : new TransportUnavailable('socket closed before opening'));
+    // A normal finish has already settled this, so reaching here with the socket open means
+    // the answer was cut off. That is a plain Error, deliberately not TransportUnavailable:
+    // this backend's socket demonstrably works, so the right response is to retry it, never
+    // to fall back to a transport that would answer "click that" with a refusal.
+    ws.onclose  = () => finish(
+      opened
+        ? (streamEnded ? undefined : new Error('the connection dropped before the answer finished'))
+        : new TransportUnavailable('socket closed before opening'));
   });
 }
 
@@ -711,6 +823,12 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   (async () => {
+    // Before anything else and without awaiting it: the spin-up runs while the user reads
+    // the intro and types, instead of inside the first question's connect budget.
+    wakeBackend();
+    // Before the first question can be sent: this decides whether a slow handshake is
+    // allowed to downgrade the turn to a transport that cannot act on the page.
+    await loadWsProven();
     await loadSettings();
     updateSetupGate();
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -1153,6 +1271,18 @@ document.addEventListener('DOMContentLoaded', () => {
         lastToolEl = null;   // a route is never the target of a tool_result tick
         scrollToEnd(view.el);
       },
+      // This turn is running over POST, so the server cannot call back into the browser and
+      // the agent holds no click, type or navigate tool. Stated as its own rail row for the
+      // same reason the lane is: a capability the turn does not have should be visible in
+      // the trace, not inferred from an apology in the answer. It persists with the
+      // transcript too, so a later report of "it refused" arrives with the cause attached.
+      noteDegraded() {
+        const label = 'Page actions unavailable — reading only';
+        steps.push({ kind: 'tool', name: 'transport:post', label, count: 1 });
+        rail.appendChild(railToolEl(label, { done: true }));
+        lastToolEl = null;
+        scrollToEnd(view.el);
+      },
       onUsage(u) {
         turnUsage = u;
       },
@@ -1282,7 +1412,8 @@ document.addEventListener('DOMContentLoaded', () => {
           <span class="key-row-icon">${group.iconHTML(id)}</span>
           <span class="key-row-meta">
             <span class="key-row-name">${escHtml(meta.label)}</span>
-            <span class="key-row-sub">${escHtml(meta.sub)}</span>
+            <span class="key-row-sub">${escHtml(meta.sub)}${
+              hint.freeTier ? '<span class="free-tag">Free tier</span>' : ''}</span>
           </span>
         </span>
         <span class="key-acc-right">
@@ -1758,11 +1889,58 @@ document.addEventListener('DOMContentLoaded', () => {
     return (lines.join('\n') || 'Nothing to do.') + '\n\n' + tail;
   }
 
-  function sendToPage(tab, message) {
+  // Resolves content.js's reply, or null when the page genuinely cannot answer.
+  //
+  // The null has to be earned. `act` reads it as "the click started a page load" and tells
+  // the agent the action ran — so a null returned merely because content.js was absent is a
+  // phantom success: nothing happened, and the agent proceeds believing it clicked. Injection
+  // is on demand only (see manifest.json), which makes "absent" an ordinary state rather than
+  // an edge case, so the two are told apart here instead of guessed at downstream.
+  //
+  // The URL is the discriminator, and the retry is gated on it deliberately: retrying blind
+  // after a real navigation could run the action twice, and "click Buy" twice is exactly the
+  // failure this whole approval model exists to prevent.
+  function sendToPage(tab, message, mayInject = true) {
     return new Promise((resolve) => {
+      const before = tab.url;
+
+      const probeThenRetry = async () => {
+        // Two independent facts decide whether re-sending is safe, and both are needed.
+        //
+        // Did the page move? If it did, the action ran — that is what navigated it — and
+        // re-sending would run it again on the new page. "Click Buy" twice is precisely
+        // what the approval model exists to prevent, so a navigation is never retried.
+        let after = before;
+        try { after = (await chrome.tabs.get(tab.id))?.url ?? before; } catch { /* tab gone */ }
+        if (before == null || after !== before) { resolve(null); return; }
+
+        // Was content.js ever there? Same page and no receiver has two causes that look
+        // identical from here: it was never injected (the action provably did not run), or
+        // it was injected and died before replying (the action may well have run). Only the
+        // first is safe to retry, and its own guard flag answers the question exactly.
+        chrome.scripting.executeScript(
+          { target: { tabId: tab.id }, func: () => !!window.__siteWhisper },
+          (probe) => {
+            if (chrome.runtime.lastError || !probe || !probe[0]) { resolve(null); return; }
+            if (probe[0].result) { resolve(null); return; }   // was loaded, stayed silent
+            chrome.scripting.executeScript(
+              { target: { tabId: tab.id }, files: ['content.js'] },
+              () => {
+                if (chrome.runtime.lastError) { resolve(null); return; }
+                sendToPage(tab, message, false).then(resolve);
+              }
+            );
+          }
+        );
+      };
+
       try {
         chrome.tabs.sendMessage(tab.id, message, (res) => {
-          if (chrome.runtime.lastError) { resolve(null); return; }
+          if (chrome.runtime.lastError) {
+            if (!mayInject) { resolve(null); return; }
+            probeThenRetry();
+            return;
+          }
           resolve(res || null);
         });
       } catch { resolve(null); }
@@ -1936,9 +2114,20 @@ document.addEventListener('DOMContentLoaded', () => {
       };
 
       let errored = false;
+      // Set by the POST branch below, spent by the first `route` frame. The degraded notice
+      // is about a capability the turn WANTED and did not get, so it waits until the lane is
+      // known: `chat` never reaches for the page, and announcing missing page tools on "hi"
+      // is noise that reads like a fault. `route` is always the first frame on this
+      // transport (_with_route yields it before the stream), so the notice still lands ahead
+      // of the answer, which is the whole point of stating it up front.
+      let degradedPending = false;
       const handlers = {
         onMeta:       () => {},
-        onRoute:      (lane) => turn.onRoute(lane),
+        onRoute:      (lane) => {
+          if (degradedPending && lane !== 'chat') turn.noteDegraded();
+          degradedPending = false;
+          turn.onRoute(lane);
+        },
         onUsage:      (u)    => turn.onUsage(u),
         onTool:       (tool) => turn.onTool(tool),
         onToolResult: (res)  => turn.onToolResult(res),
@@ -1949,29 +2138,61 @@ document.addEventListener('DOMContentLoaded', () => {
       };
 
       // The socket first, because it is the only transport that can run page actions: it
-      // lets the server call back mid-run. A backend or proxy without WebSocket support
-      // falls back to POST, which still answers questions — it just cannot act.
+      // lets the server call back mid-run. Falling back to POST costs the user every verb,
+      // so the decision to do it is made on what we actually know about this backend:
+      //
+      //   never connected  — we cannot tell "no WebSocket support" from "still waking up".
+      //                      Try twice on the sized budget before downgrading. The second
+      //                      attempt is nearly free when support is genuinely absent — a
+      //                      refused upgrade fails immediately rather than burning the
+      //                      budget — and it is decisive when the socket was merely slow,
+      //                      which is the case that was costing the user every page verb.
+      //                      Only after both does a reading-only answer beat no answer.
+      //   connected before — the socket demonstrably exists, so this failure is transient.
+      //                      Retry it, and never downgrade: answering "click the button"
+      //                      with a refusal about being unable to click reads as a broken
+      //                      product, where a dropped-connection error reads as what it is
+      //                      and names the one thing that helps.
       let done = false;
       if (wsWorthTrying()) {
-        try {
-          await runWsQuery(
-            { ...payload, token: key, provider: selectedProvider },
-            handlers,
-            controller.signal,
-          );
-          done = true;
-        } catch (err) {
-          if (err?.name === 'AbortError') { endAborted(); return; }
-          if (!(err instanceof TransportUnavailable)) {
-            setStreaming(view, false);
-            turn.fail('Connection lost: ' + (err?.message || err));
-            return;
+        for (let attempt = 0; attempt < 2 && !done; attempt++) {
+          try {
+            await runWsQuery(
+              { ...payload, token: key, provider: selectedProvider },
+              handlers,
+              controller.signal,
+            );
+            done = true;
+          } catch (err) {
+            if (err?.name === 'AbortError') { endAborted(); return; }
+            if (!(err instanceof TransportUnavailable)) {
+              setStreaming(view, false);
+              turn.fail('Connection lost: ' + (err?.message || err));
+              return;
+            }
+            // Reaching here means the socket never opened — one that opens and then fails
+            // throws a plain Error, caught above — so no frames arrived and a retry cannot
+            // duplicate a partial answer. wsProven can only be true from an earlier turn,
+            // and when it is, this backend has a working socket and must not be written off.
+            // Only once both attempts are spent: writing the backend off after the first
+            // would be recording a verdict the second attempt has not returned yet.
+            if (!wsProven && attempt === 1) markWsUnavailable();   // don't re-pay the connect timeout every question
           }
-          markWsUnavailable();   // don't re-pay the connect timeout every question
+        }
+        if (!done && wsProven) {
+          setStreaming(view, false);
+          turn.fail('Lost the connection to the backend. Try that again.');
+          return;
         }
       }
 
       if (!done) {
+        // Say it plainly, in the rail, before the answer arrives. The alternative is the
+        // model explaining its own missing tools — which is accurate and reads exactly like
+        // the product being broken. Armed rather than emitted: onRoute above drops it when
+        // the lane turns out to be `chat`, which lost nothing by running over POST.
+        degradedPending = true;
+
         // Best-effort: a page that will not yield its text degrades to a knowledge answer,
         // which is why this resolves to '' instead of failing the turn.
         const pageText = await new Promise((resolve) =>
@@ -1991,6 +2212,8 @@ document.addEventListener('DOMContentLoaded', () => {
           turn.fail('Could not reach backend: ' + err.message);
           return;
         }
+
+        noteBackendContact();   // it answered, so the next turn sizes the socket as awake
 
         if (!response.ok) {
           setStreaming(view, false);

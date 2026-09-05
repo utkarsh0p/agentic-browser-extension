@@ -23,7 +23,7 @@ docker compose up --build         # containerised, same port
 # Extension
 # chrome://extensions → Developer mode → Load unpacked → repo root.
 # After editing content.js/background.js, hit reload on the extension card AND reload
-# any open tab — a stale content script stays injected in already-loaded tabs.
+# any open tab — a copy injected before the edit stays live in that tab until it reloads.
 # popup/ changes only need the side panel closed and reopened.
 ```
 
@@ -45,9 +45,9 @@ popup/popup.js  ──ws /chat/ws──▶  backend/server.py
    └─ chrome.tabs.sendMessage ──▶ content.js  (element map, verbs)
 ```
 
-**`content.js`** — page agent, injected declaratively for `<all_urls>` and on demand via
-`chrome.scripting.executeScript` for tabs that predate the extension load. Guarded by
-`window.__siteWhisper` against double-injection. Builds the numbered element map (a distilled
+**`content.js`** — page agent, injected **on demand only** via
+`chrome.scripting.executeScript`; the manifest declares no content script, so nothing runs on
+a page until the user asks. Guarded by `window.__siteWhisper` against double-injection. Builds the numbered element map (a distilled
 a11y tree, not markup) and executes the verbs. Answers two messages: `SW_SNAPSHOT` and
 `SW_ACT`, both async (`return true`).
 
@@ -77,6 +77,14 @@ These will not fail loudly if broken:
 - **The frame vocabulary is shared by both transports.** `text` / `tool` / `tool_result` /
   `route` / `usage` / `error` / `done`, dispatched in one place (`dispatchFrame` in
   `popup.js`). SSE wraps them in `data: `; the WebSocket sends them raw.
+- **A `null` from `sendToPage` must be earned.** `act` reads it as "the click navigated" and
+  reports the action as having run, so a `null` returned merely because `content.js` was not
+  injected is a phantom success — nothing happened and the agent believes it clicked. Since
+  injection is on demand, "absent" is an ordinary state, so a retry needs **two** facts, and
+  both are load-bearing: `tab.url` unchanged (a navigation means the action already ran and
+  re-sending would run it again on the new page) **and** `window.__siteWhisper` absent (the
+  guard flag distinguishes "never injected", which is safe to retry, from "injected and died
+  before replying", which is not). Retrying on either fact alone double-executes.
 - **Turns are stateless.** `_build_messages` sends only the current query — no history. The
   panel stores and displays the transcript, but the model never sees it. `ChatRequest.history`
   is accepted and ignored on purpose.
@@ -124,8 +132,9 @@ is unreachable.
 - Approvals are gated **only** on the server (`_hitl_config`). A second gate in the panel would
   double-ask; the old client-side refusal was removed deliberately.
 - `restricted` (default) asks before submits, risky-named clicks (`RISKY_NAME`), and secret
-  fields (`SECRET_FIELD`). `unrestricted` covers page actions only — external side effects ask
-  in either mode. It is a plain variable, not storage, so it resets on every panel reopen.
+  fields (`SECRET_FIELD`). `unrestricted` lifts the gate on page actions and nothing else;
+  anything outside `SAFE_TOOL_NAMES` still asks in both modes. It is a plain variable, not
+  storage, so it resets on every panel reopen.
 - Secrets never reach the model: `ask_user` answers are stashed in the panel and swapped in by
   `fillSecrets` at the moment of typing.
 - `goto` accepts `http`/`https` only (`safeUrl`), keeping the agent out of `javascript:`,

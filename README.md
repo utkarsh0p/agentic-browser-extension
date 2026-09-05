@@ -29,12 +29,17 @@ server — you add a key from Anthropic, Google, OpenAI or Groq, and it lives in
 One key is enough to start. The panel opens straight into a setup screen and unlocks as
 soon as you add one.
 
-| Provider | Models |
-|---|---|
-| **Claude** — Anthropic | Opus 5 · Sonnet 5 |
-| **Gemini** — Google | 3.7 Flash · 3.6 Flash |
-| **GPT** — OpenAI | GPT-5.6 Sol · GPT-5.6 Terra |
-| **Groq** — GroqCloud | Qwen3.6 27B |
+| Provider | Models | Free tier? |
+|---|---|---|
+| **Gemini** — Google | 3.8 Flash · 3.7 Flash · 3.6 Flash | **Yes**, ongoing |
+| **Groq** — GroqCloud | Qwen3.8 27B · Qwen3.6 27B | **Yes**, ongoing — but 8K tokens/min |
+| **Claude** — Anthropic | Opus 5 · Sonnet 5 | No — $5 trial credit, then billing |
+| **GPT** — OpenAI | GPT-6 Astra · GPT-5.6 Sol · GPT-5.6 Terra | No — $5 trial credit, then billing |
+
+**If you don't want to pay, use Gemini or Groq.** They are the only two with a real free
+tier; the other two give new accounts a one-time credit and then require a payment method.
+Groq's free tier is generous per day but capped at 8K tokens per minute, which a long
+multi-step page task can exceed — you'll get a "wait and try again" message when it does.
 
 The list is short deliberately. Driving a page needs a model that can hold a ~200-line
 element map, pick the right line out of it, and stay oriented after the context middleware
@@ -65,8 +70,9 @@ locally too, one entry per browser window.
 
 ### The element map
 
-`content.js` walks the page and emits a numbered snapshot — a distilled accessibility tree,
-not markup. ~400 characters of button HTML collapses to one line:
+`content.js` is injected into the page the first time you ask something of it — there is no
+content script running in the background — and emits a numbered snapshot: a distilled
+accessibility tree, not markup. ~400 characters of button HTML collapses to one line:
 
 ```
 page: Sign in — Example
@@ -249,9 +255,10 @@ const BACKEND = 'http://localhost:5000';       // local
 
 ```
 agentic-browser-extension/
-├── manifest.json          # MV3 — permissions, content script, side panel
+├── manifest.json          # MV3 — permissions, side panel
 ├── background.js          # Service worker: toolbar click, chat cleanup
 ├── content.js             # Page agent: builds the element map, runs the verbs
+│                          #   (injected on demand — never runs until you ask)
 │
 ├── popup/                 # The side panel (path kept from the popup era)
 │   ├── popup.html
@@ -277,7 +284,12 @@ agentic-browser-extension/
 - **The map caps at 200 elements**, and says so when it does. A control can be on the page
   and not listed — the agent has ways around that, including asking you what you can see.
 - **Page actions need the WebSocket.** Over the `POST` fallback it can still read and answer,
-  but not click or type.
+  but not click or type — and it says so, as a **Page actions unavailable** row in the rail,
+  rather than leaving the model to explain the tools it is missing.
+- **The panel wakes the backend when it opens.** A host that spins down when idle does its
+  cold start while you are still typing, instead of inside the socket's connect budget. Once
+  a socket has connected in a session the panel knows the backend has one, so a later blip is
+  retried rather than downgraded to the reading-only transport.
 
 ---
 

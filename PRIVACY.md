@@ -1,6 +1,6 @@
 # Privacy Policy — SiteWhisper
 
-**Last updated:** September 4, 2026
+**Last updated:** September 5, 2026
 
 ## What data does SiteWhisper read?
 
@@ -29,8 +29,10 @@ This can include acting inside sites where you are already signed in. You stay i
   similar), and before typing into a password or payment field.
 - **Unrestricted mode** runs those page actions without asking. It applies to page actions only,
   it is never remembered, and closing the panel always returns you to Restricted.
-- **Actions in outside services** — sending an email through a connected account, for example —
-  ask for approval in either mode.
+
+SiteWhisper acts only on the page you are viewing. It has no access to your email, your files,
+or any other service, and it cannot reach an account you are not already signed in to in that
+tab.
 
 When it needs a value it does not have, it asks you. Anything you type into such a prompt stays
 in your browser: it is inserted into the page at the moment of typing, is never sent to the AI
@@ -58,7 +60,14 @@ Depending on your configuration, your message and the page content may be proces
 - **Anthropic** (Claude), **Google** (Gemini), **OpenAI** (GPT), or **Groq** — to generate
   answers and decide actions
 
-Each provider's own privacy policy applies to that interaction.
+Each provider's own privacy policy applies to that interaction, and it is the policy of the
+plan your key is on.
+
+**Free tiers may train on what you send.** Google states that prompts and responses on the
+Gemini free tier may be used to improve its products, and other providers have similar terms
+for free or data-sharing plans. If you would rather your page content was not used for
+training, use a paid plan with the provider you have chosen. This is a matter between you and
+that provider — SiteWhisper passes your key through and stores nothing.
 
 ## Chat history
 
