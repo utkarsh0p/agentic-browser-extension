@@ -21,6 +21,8 @@ server — you add a key from Anthropic, Google, OpenAI or Groq, and it lives in
 | **Fill things in** | *"Fill this form with my details and submit it"* — it asks you for anything it doesn't know |
 | **Look something up** | *"Search for the tallest building and tell me who built it"* — the browser is its internet access; it navigates and reads |
 | **Work inside an app you have open** | *"Delete the first email"* while you're sitting in Gmail |
+| **New to a site ? need help** | *"I could not fine the login, do it for me |
+
 
 ---
 
